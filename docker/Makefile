@@ -132,6 +132,7 @@ base_pull:
 	docker pull $(IMAGE_WITH_TAG)
 
 DOCKER_RUN_OPTS ?= --rm -it --ipc=host --ulimit stack=67108864 $(if $(filter 0,$(IS_ROOTLESS)),--ulimit memlock=-1)
+RDMA_DOCKER_RUN_ARGS ?= $(shell if [ -e /dev/infiniband ]; then printf '%s' '--device=/dev/infiniband --cap-add=IPC_LOCK --cap-add=SYS_RESOURCE --cap-add=NET_RAW --volume /sys/class/infiniband:/sys/class/infiniband:ro --volume /sys/devices:/sys/devices:ro'; fi)
 DOCKER_RUN_ARGS   ?=
 # Check if NVIDIA_VISIBLE_DEVICES is set and not empty
 NVIDIA_VISIBLE_DEVICES_VAL = $(shell echo $$NVIDIA_VISIBLE_DEVICES)
@@ -163,7 +164,7 @@ endif
 ifeq ($(LOCAL_USER),1)
 	$(call add_local_user,$(IMAGE_WITH_TAG))
 endif
-	docker run $(DOCKER_RUN_OPTS) $(DOCKER_RUN_ARGS) \
+	docker run $(DOCKER_RUN_OPTS) $(RDMA_DOCKER_RUN_ARGS) $(DOCKER_RUN_ARGS) \
     		$(GPU_OPTS) \
     		--volume $(SOURCE_DIR):$(CODE_DIR) \
     		$(EXTRA_VOLUMES) \

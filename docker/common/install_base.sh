@@ -69,6 +69,13 @@ init_ubuntu() {
   apt remove -y ibverbs-providers libibverbs1
   apt-get --reinstall install -y libibverbs-dev
   apt-get install -y --no-install-recommends \
+    rdma-core \
+    libibverbs1 \
+    libibverbs-dev \
+    ibverbs-utils \
+    ibverbs-providers \
+    gcc \
+    libc-dev \
     libtool \
     autoconf \
     automake \
