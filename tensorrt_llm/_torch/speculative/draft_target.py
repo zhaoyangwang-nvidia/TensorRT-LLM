@@ -20,6 +20,7 @@ where the draft and target models share the same model engine. The draft model
 layers are integrated into the target model's KV cache and run in a single forward pass.
 """
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -27,6 +28,7 @@ import torch
 from torch import nn
 
 from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
@@ -36,6 +38,13 @@ from .mtp import MTPSampler
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import DraftTargetDecodingConfig
+
+
+def _env_enabled(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
 @dataclass
@@ -96,6 +105,54 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
         super().__init__(use_separate_draft_kv_cache)
         self.spec_config = spec_config
         self.mapping = mapping
+        self._rdma_offload_enabled = bool(
+            getattr(spec_config, "draft_offload_enabled", False)
+            or _env_enabled("TLLM_DRAFT_RDMA_OFFLOAD")
+        )
+        self._rdma_draft_client = None
+        # Accumulates ALL output tokens across decode rounds so the draft server
+        # can reconstruct the full generation context (prompt tokens are prepended
+        # by the server side using the known prompt text).
+        self._rdma_output_history: list[int] = []
+        if self._rdma_offload_enabled:
+            if getattr(mapping, "tp_size", 1) != 1 or getattr(mapping, "pp_size", 1) != 1:
+                raise RuntimeError(
+                    "RDMA draft offload target path currently supports only "
+                    "single-rank TP/PP. Disable draft_offload_enabled for "
+                    "multi-rank runs."
+                )
+            from .rdma_draft_offload import RdmaDraftOffloadClient, RdmaDraftOffloadConfig
+
+            self._rdma_draft_client = RdmaDraftOffloadClient(
+                RdmaDraftOffloadConfig(
+                    nic_name=getattr(
+                        spec_config,
+                        "draft_offload_nic_name",
+                        os.environ.get("TLLM_DRAFT_RDMA_NIC", "mlx5_0"),
+                    ),
+                    server_host=getattr(
+                        spec_config,
+                        "draft_offload_server_host",
+                        os.environ.get("TLLM_DRAFT_RDMA_HOST", "127.0.0.1"),
+                    ),
+                    server_port=int(
+                        getattr(
+                            spec_config,
+                            "draft_offload_server_port",
+                            os.environ.get("TLLM_DRAFT_RDMA_PORT", "47320"),
+                        )
+                    ),
+                    gpu_id=getattr(spec_config, "draft_offload_gpu_id", None),
+                    max_draft_len=int(spec_config.max_draft_len),
+                    buffer_size=int(getattr(spec_config, "draft_offload_buffer_size", 4096)),
+                )
+            )
+            logger.info(
+                "DraftTarget RDMA draft offload enabled: host=%s port=%s nic=%s",
+                self._rdma_draft_client.config.server_host,
+                self._rdma_draft_client.config.server_port,
+                self._rdma_draft_client.config.nic_name,
+            )
 
     @property
     def max_draft_len(self) -> int:
@@ -162,6 +219,7 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
         spec_metadata: DraftTargetOneModelSpecMetadata,
         draft_model: nn.Module,
         resource_manager=None,
+        is_warmup: bool = False,
     ):
         """
         Technically incorrect at the moment.
@@ -183,6 +241,46 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
         accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
             logits, attn_metadata, spec_metadata
         )
+
+        if self._rdma_offload_enabled:
+            if bool(is_warmup):
+                # Warmup: initialize RDMA connection and exercise one real
+                # round-trip (tokens=[] → draft server sees only the prompt).
+                # This pre-warms the QP, GPU buffers, and NIC queues so the
+                # first real decode step does not pay connection-setup latency.
+                # Output history is NOT updated; the result is discarded.
+                self._rdma_draft_client.request(
+                    tokens=[],
+                    position=0,
+                    max_draft_len=self.max_draft_len,
+                    device=logits.device,
+                )
+                next_draft_tokens = torch.zeros(
+                    (batch_size, self.max_draft_len), dtype=torch.int32, device=logits.device
+                )
+            else:
+                next_draft_tokens = self._rdma_offload_draft_tokens(
+                    accepted_tokens=accepted_tokens,
+                    num_accepted_tokens=num_accepted_tokens,
+                    position_ids=position_ids,
+                    logits=logits,
+                    batch_size=batch_size,
+                )
+            next_new_tokens = self._prepare_next_new_tokens(
+                accepted_tokens,
+                next_draft_tokens,
+                spec_metadata.batch_indices_cuda,
+                batch_size,
+                num_accepted_tokens,
+            )
+            attn_metadata.use_spec_decoding = True
+            return {
+                "logits": raw_logits,
+                "new_tokens": accepted_tokens,
+                "new_tokens_lens": num_accepted_tokens,
+                "next_draft_tokens": next_draft_tokens,
+                "next_new_tokens": next_new_tokens,
+            }
 
         # Prepare attention metadata for speculative decoding and save state for restore
         self._prepare_attn_metadata_for_draft_target(attn_metadata, spec_metadata)
@@ -296,6 +394,56 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
             "next_draft_tokens": next_draft_tokens,
             "next_new_tokens": next_new_tokens,
         }
+
+    def _rdma_offload_draft_tokens(
+        self,
+        *,
+        accepted_tokens: torch.Tensor,
+        num_accepted_tokens: torch.Tensor,
+        position_ids: Optional[torch.Tensor],
+        logits: torch.Tensor,
+        batch_size: int,
+    ) -> torch.Tensor:
+        if self._rdma_draft_client is None:
+            raise RuntimeError("RDMA draft offload client was not initialized")
+        if int(batch_size) != 1:
+            raise RuntimeError("RDMA draft offload target path currently supports batch_size=1")
+
+        accepted_count = int(num_accepted_tokens[0].detach().cpu().item())
+        accepted_count = max(1, min(accepted_count, accepted_tokens.shape[1]))
+
+        if position_ids is None or int(position_ids.numel()) == 0:
+            position = 0
+        else:
+            position = int(position_ids.reshape(-1)[-1].detach().cpu().item())
+
+        # Accumulate all accepted output tokens for full-context draft inference.
+        for i in range(accepted_count):
+            self._rdma_output_history.append(int(accepted_tokens[0, i].detach().cpu().item()))
+        # Cap at MAX_TOKENS (64) to fit in the RDMA buffer.
+        tokens_to_send = self._rdma_output_history[-64:]
+
+        logger.info(
+            "[RDMA] _rdma_offload_draft_tokens: round=%d pos=%d ctx_len=%d",
+            self._rdma_draft_client.round_seq,
+            position,
+            len(tokens_to_send),
+        )
+        draft_tokens = self._rdma_draft_client.request(
+            tokens=tokens_to_send,
+            position=position,
+            max_draft_len=self.max_draft_len,
+            device=logits.device,
+        )
+        logger.info("[RDMA] got draft tokens: %s", draft_tokens)
+        if not draft_tokens:
+            draft_tokens = [0]
+        if len(draft_tokens) < self.max_draft_len:
+            draft_tokens = draft_tokens + [draft_tokens[-1]] * (
+                self.max_draft_len - len(draft_tokens)
+            )
+        draft_tokens = draft_tokens[: self.max_draft_len]
+        return torch.tensor([draft_tokens], dtype=torch.int32, device=logits.device)
 
     def sample_and_accept_draft_tokens(
         self,
