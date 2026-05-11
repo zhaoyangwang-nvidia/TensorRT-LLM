@@ -1496,6 +1496,14 @@ class DraftTargetDecodingConfig(DecodingBaseConfig):
     draft_offload_server_port: int = 47320
     draft_offload_gpu_id: Optional[int] = None
     draft_offload_buffer_size: int = 4096
+    # Phase 5+ (izzy-compatible) RDMA path.  When ``draft_offload_v2=True``
+    # the worker uses ``IbverbsDraftOffloadLayer`` (96-byte WRITE_WITH_IMM,
+    # imm_data routing) instead of the legacy 4 KiB protocol.  Set both
+    # flags True to enable the new path; leave ``draft_offload_v2=False``
+    # to keep the legacy step-3 baseline.
+    draft_offload_v2: bool = False
+    draft_offload_v2_max_num_requests: int = 256
+    draft_offload_v2_remote_peer_name: str = "draft_lpu"
 
     @model_validator(mode="after")
     def validate_draft_target_config(self):
@@ -1513,6 +1521,9 @@ class DraftTargetDecodingConfig(DecodingBaseConfig):
             if self.draft_offload_buffer_size <= 0:
                 raise ValueError("draft_offload_buffer_size must be > 0, got "
                                  f"{self.draft_offload_buffer_size}")
+        if self.draft_offload_v2 and not self.draft_offload_enabled:
+            raise ValueError(
+                "draft_offload_v2 requires draft_offload_enabled=True")
         self.max_total_draft_tokens = self.max_draft_len  # Current DraftTarget only supports linear tree
         return self
 

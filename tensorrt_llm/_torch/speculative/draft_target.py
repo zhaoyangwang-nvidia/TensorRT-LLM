@@ -109,10 +109,16 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
             getattr(spec_config, "draft_offload_enabled", False)
             or _env_enabled("TLLM_DRAFT_RDMA_OFFLOAD")
         )
+        self._rdma_offload_v2 = bool(
+            getattr(spec_config, "draft_offload_v2", False)
+            or _env_enabled("TLLM_DRAFT_RDMA_OFFLOAD_V2")
+        )
         self._rdma_draft_client = None
+        self._rdma_v2_offload_layer = None
         # Accumulates ALL output tokens across decode rounds so the draft server
         # can reconstruct the full generation context (prompt tokens are prepended
         # by the server side using the known prompt text).
+        # Only used by the v1 path.  V2 stateful sessions live on the draft side.
         self._rdma_output_history: list[int] = []
         if self._rdma_offload_enabled:
             if getattr(mapping, "tp_size", 1) != 1 or getattr(mapping, "pp_size", 1) != 1:
@@ -121,38 +127,69 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
                     "single-rank TP/PP. Disable draft_offload_enabled for "
                     "multi-rank runs."
                 )
-            from .rdma_draft_offload import RdmaDraftOffloadClient, RdmaDraftOffloadConfig
-
-            self._rdma_draft_client = RdmaDraftOffloadClient(
-                RdmaDraftOffloadConfig(
-                    nic_name=getattr(
-                        spec_config,
-                        "draft_offload_nic_name",
-                        os.environ.get("TLLM_DRAFT_RDMA_NIC", "mlx5_0"),
-                    ),
-                    server_host=getattr(
-                        spec_config,
-                        "draft_offload_server_host",
-                        os.environ.get("TLLM_DRAFT_RDMA_HOST", "127.0.0.1"),
-                    ),
-                    server_port=int(
-                        getattr(
-                            spec_config,
-                            "draft_offload_server_port",
-                            os.environ.get("TLLM_DRAFT_RDMA_PORT", "47320"),
-                        )
-                    ),
-                    gpu_id=getattr(spec_config, "draft_offload_gpu_id", None),
-                    max_draft_len=int(spec_config.max_draft_len),
-                    buffer_size=int(getattr(spec_config, "draft_offload_buffer_size", 4096)),
+            if self._rdma_offload_v2:
+                # New izzy-compatible 96-byte WRITE_WITH_IMM path.
+                from .ibverbs_draft_offload import (
+                    IbverbsDraftOffloadConfig,
+                    IbverbsDraftOffloadLayer,
                 )
-            )
-            logger.info(
-                "DraftTarget RDMA draft offload enabled: host=%s port=%s nic=%s",
-                self._rdma_draft_client.config.server_host,
-                self._rdma_draft_client.config.server_port,
-                self._rdma_draft_client.config.nic_name,
-            )
+
+                self._rdma_v2_offload_layer = IbverbsDraftOffloadLayer(
+                    IbverbsDraftOffloadConfig(
+                        nic_name=getattr(spec_config, "draft_offload_nic_name", "mlx5_0"),
+                        server_host=getattr(spec_config, "draft_offload_server_host", "127.0.0.1"),
+                        server_port=int(getattr(spec_config, "draft_offload_server_port", 47000)),
+                        remote_peer_name=getattr(
+                            spec_config, "draft_offload_v2_remote_peer_name", "draft_lpu"
+                        ),
+                        max_num_requests=int(
+                            getattr(spec_config, "draft_offload_v2_max_num_requests", 256)
+                        ),
+                        max_draft_len=int(spec_config.max_draft_len),
+                    )
+                )
+                logger.info(
+                    "DraftTarget RDMA-v2 (izzy compatible) enabled: host=%s port=%s nic=%s "
+                    "max_num_requests=%s max_draft_len=%s",
+                    spec_config.draft_offload_server_host,
+                    spec_config.draft_offload_server_port,
+                    spec_config.draft_offload_nic_name,
+                    spec_config.draft_offload_v2_max_num_requests,
+                    spec_config.max_draft_len,
+                )
+            else:
+                from .rdma_draft_offload import RdmaDraftOffloadClient, RdmaDraftOffloadConfig
+
+                self._rdma_draft_client = RdmaDraftOffloadClient(
+                    RdmaDraftOffloadConfig(
+                        nic_name=getattr(
+                            spec_config,
+                            "draft_offload_nic_name",
+                            os.environ.get("TLLM_DRAFT_RDMA_NIC", "mlx5_0"),
+                        ),
+                        server_host=getattr(
+                            spec_config,
+                            "draft_offload_server_host",
+                            os.environ.get("TLLM_DRAFT_RDMA_HOST", "127.0.0.1"),
+                        ),
+                        server_port=int(
+                            getattr(
+                                spec_config,
+                                "draft_offload_server_port",
+                                os.environ.get("TLLM_DRAFT_RDMA_PORT", "47320"),
+                            )
+                        ),
+                        gpu_id=getattr(spec_config, "draft_offload_gpu_id", None),
+                        max_draft_len=int(spec_config.max_draft_len),
+                        buffer_size=int(getattr(spec_config, "draft_offload_buffer_size", 4096)),
+                    )
+                )
+                logger.info(
+                    "DraftTarget RDMA-v1 (legacy 4 KiB) enabled: host=%s port=%s nic=%s",
+                    self._rdma_draft_client.config.server_host,
+                    self._rdma_draft_client.config.server_port,
+                    self._rdma_draft_client.config.nic_name,
+                )
 
     @property
     def max_draft_len(self) -> int:
@@ -265,6 +302,7 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
                     position_ids=position_ids,
                     logits=logits,
                     batch_size=batch_size,
+                    request_ids=getattr(spec_metadata, "request_ids", None),
                 )
             next_new_tokens = self._prepare_next_new_tokens(
                 accepted_tokens,
@@ -403,7 +441,29 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
         position_ids: Optional[torch.Tensor],
         logits: torch.Tensor,
         batch_size: int,
+        request_ids: Optional[list] = None,
     ) -> torch.Tensor:
+        # V2 path: izzy-compatible 96-byte WRITE_WITH_IMM via
+        # ``IbverbsDraftOffloadLayer``.  All bookkeeping (round_seq,
+        # route binding, response dispatch) happens inside the layer.
+        if self._rdma_v2_offload_layer is not None:
+            if request_ids is None or len(request_ids) != int(batch_size):
+                # Fall back to a synthetic request id; v2 needs one per row.
+                request_ids = list(range(int(batch_size)))
+            return self._rdma_v2_offload_layer(
+                input_ids=accepted_tokens,
+                position_ids=(
+                    position_ids
+                    if position_ids is not None
+                    else torch.zeros((batch_size,), dtype=torch.int64, device=logits.device)
+                ),
+                accepted_tokens=accepted_tokens,
+                num_accepted_tokens=num_accepted_tokens,
+                batch_size=int(batch_size),
+                num_contexts=0,
+                request_ids=request_ids,
+            )
+
         if self._rdma_draft_client is None:
             raise RuntimeError("RDMA draft offload client was not initialized")
         if int(batch_size) != 1:
