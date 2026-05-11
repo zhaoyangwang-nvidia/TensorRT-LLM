@@ -278,3 +278,111 @@ target v2 + 真 draft / 和 izzy LPU 互通。但是 GPU-export 这一步过不�
    25.07 + ConnectX-7 上失败，问他们能否确认 cert 矩阵
 4. 同时准备好 software 层：等 export 通的时候，doca_endpoint.py 写起来
    也就是 200 行
+
+---
+
+## 增补：path 1 重试结果（DOCA 3.2 → 3.3 + handler 探针）
+
+### 升级 DOCA → 3.3.0
+
+```bash
+sed -i 's|doca/3.2.0|doca/3.3.0|' /etc/apt/sources.list.d/doca.list
+apt-get update
+apt-get install --reinstall doca-devel doca-sdk-verbs libdoca-sdk-verbs-dev \
+                            doca-sdk-gpunetio libdoca-sdk-gpunetio-dev
+# 装上 doca-devel 3.3.0-088000、doca-sdk-gpunetio 3.3.0109-1
+```
+
+izzy extension 重新 `cmake + make` 在 DOCA 3.3 上**零修改**编过。
+
+### 关键发现：5 个 NIC handler，izzy 默认只试最严格的 1 个
+
+`doca_gpunetio_verbs_def.h` 里列出 5 种 NIC handler：
+
+| id | name | 含义 | 我们这台 |
+|---|---|---|---|
+| 0 | AUTO | DOCA 自动选最快可用的 | ✅ export OK |
+| 1 | CPU_PROXY | CPU 帮 GPU ring doorbell | ✅ export OK |
+| 2 | GPU_SM_DB | GPU SM 直接 ring normal doorbell | ❌ 失败 |
+| 3 | GPU_SM_BF | GPU SM 用 BlueFlame doorbell | ❌ 失败 |
+| 4 | GPU_SM_NO_DBR | GPU SM 不更新 DBREC | ❌ 失败 |
+
+izzy 的 `load_nic_handler_candidates()` **默认只试 id=2**（GPU_SM_DB）。
+有 env override：
+
+```bash
+export GLUE_RDMA_NIC_HANDLERS=0          # 试 AUTO
+export GLUE_RDMA_ALLOW_PROXY_HANDLERS=1  # 允许 CPU_PROXY 进入候选
+```
+
+设这两个之后，**QP export 在我们这台机器成功**：
+
+```
+[DOCA][INF] Exported QP to GPU with NIC handler id=0
+[client] connect_to_peer: True
+[client] exchange_buffer_info: True
+[server] accept_peer: True
+[server] exchange_buffer_info: True
+```
+
+### 但 ❌ 实际 WRITE_WITH_IMM 没传输到对端
+
+```python
+torch.ops.doca_rdma.write_with_imm(qp_ptr, ...)
+torch.cuda.synchronize()
+# → wqe_idx=0 (WQE 构造成功)
+
+torch.ops.doca_rdma.wait_send(qp_ptr, send_t, wqe_out)
+# → 永远 hang，超时 20s 都不返回
+```
+
+server 端 5s 后读 recv buffer：
+
+```
+[server] recv buf first 32 bytes: [0, 0, 0, ...]
+[server] payload pattern matches expected (0xa0..0xff): False
+```
+
+WQE 写到 GPU memory 里了，但 NIC 没真去取（doorbell ring 不生效或被吞）。
+`wait_send` kernel 一直在 poll send CQ 等 completion，永远等不到。
+
+### 推论：path 1 在这台机器没办法走通
+
+升级 DOCA 让 `export_qp` API 通过了——这是 izzy 默认场景里 fail 的那一步。
+但更深的一层（GPU SM 或 CPU proxy 实际 ring NIC doorbell 触发 DMA）需要
+**mlx5 内核驱动的 BAR1 mapping 支持** + **NIC firmware 配合**。我们这里
+OFED 25.07 的 BAR1 GPU peer-to-peer 配置不全，DOCA 用户态把请求发到驱动，
+驱动转给 NIC 那一步还是断的。
+
+也就是：path 1（容器内换 DOCA）部分有效——**unblock 了 1 个 layer 的
+failure**，但下一层还在 host kernel 里挡着。
+
+### 现在能确定的事
+
+| 任务 | 状态 |
+|---|---|
+| DOCA SDK 在 TRT-LLM 容器跑得起来 | ✅ |
+| izzy 全部 C++/CUDA extension 在 CUDA 13 + Ubuntu 24.04 编出来 | ✅ |
+| `torch.ops.doca_rdma.write_with_imm` 等 6 个 GPU op 注册 | ✅ |
+| `DocaRdmaEndpoint.init/alloc/connect/exchange/...` | ✅ |
+| QP 导出到 GPU 设备地址空间 | ✅（需 env override） |
+| WQE 在 GPU 上构造 | ✅ |
+| NIC 实际取 WQE 走 PCIe DMA 发包 | ❌ |
+| send completion 反馈到 GPU recv CQ | ❌ |
+| CUDA graph 录 RDMA round-trip | 不能（依赖上面） |
+
+### 修订后的下一步
+
+- **path 2（host OFED 升级）依然是最干净的解法** —— 升级后 GPU_SM_DB
+  handler 大概率能通，整个 happy path 串起来
+- 给 NV DOCA team 报这个具体 issue：**DOCA 3.3 + OFED 25.07 + ConnectX-7 +
+  B200** 组合下，AUTO 能 export QP 但无法真正传输；问他们 cert 矩阵 +
+  推荐 OFED 版本
+- 如果一定要在这台机器有"GPU initiated 的部分"——可以再试 izzy 自家
+  `tests/test_standalone_round_trip.py` + `run_test.sh` 这两个，看他们
+  自己 CI 是不是也跑同款硬件。如果 izzy 也跑同款 NIC 通过，那是他们某个
+  env 我们漏了；如果他们跑别的 NIC（H100 配 ConnectX-7 with newer FW），
+  那这台机就是不行
+- software 层不用再等 —— `doca_endpoint.py` 200 行的实现可以先按我们
+  现在的 API 草稿写出来，runtime check `_TrtLlmBackend` 一样的 try/except
+  fallback 到 ibverbs。这样硬件配上来时直接 toggle 就能上
