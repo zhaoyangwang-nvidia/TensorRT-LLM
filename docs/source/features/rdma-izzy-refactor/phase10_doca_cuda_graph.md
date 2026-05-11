@@ -386,3 +386,73 @@ failure**，但下一层还在 host kernel 里挡着。
 - software 层不用再等 —— `doca_endpoint.py` 200 行的实现可以先按我们
   现在的 API 草稿写出来，runtime check `_TrtLlmBackend` 一样的 try/except
   fallback 到 ibverbs。这样硬件配上来时直接 toggle 就能上
+
+---
+
+## 官方兼容矩阵确认（NVIDIA DOCA 3.3 release notes）
+
+> 来源：NVIDIA DOCA SDK 3.3 release notes / GPUNetIO programming guide
+> （`docs.nvidia.com/doca/sdk/3.3/`）
+
+### Certified 组合
+
+> DOCA 3.3 + ConnectX-7 + B200 (sm_100) + **MLNX_OFED 25.10**
+
+依据：DOCA 3.3.0 正式引入对 **Blackwell (sm_100)** 架构（B200, GB200 等）的支持。
+配套驱动栈里，**MLNX_OFED 25.10**（或对应的 DOCA-OFED 25.10）是
+专为支持新一代 GPU 指令集和网络特性设计的版本。
+
+### OFED 25.07 的状态：明确不支持
+
+> 对于 B200 及以上架构，**官方建议最低使用 MLNX_OFED 25.10**
+
+依据：OFED 25.07 发布在 Blackwell 大规模商用前，**没包含针对 sm_100
+的底层原子操作支持**——特别是 **GPU Register 直接访问相关的 flag**
+（这正是 GPU_SM_DB 模式下 GPU SM 写 NIC doorbell 走的那条路）。
+
+### 把官方说法对应到我们的失败现象
+
+| DOCA 文档要求 | 我们实测对应症状 |
+|---|---|
+| sm_100 上需要 OFED 25.10 提供 "GPU Register 直接访问 flag" | `doca_gpu_verbs_export_qp(GPU_SM_DB)` 在 25.07 上返回 "DOCA Driver call failure" |
+| GPU SM 写 NIC BAR 的 P2P doorbell 路径在 25.10 才完整 | 我们能 export 普通 ibverbs MR（GPUDirect 数据路径 OK），但 export GPU-initiated QP 失败 |
+| AUTO 会试可用 handler 并 fallback | 我们 AUTO setup 成功（落到 CPU_PROXY 布局），但 runtime 没人调 `cpu_proxy_progress` |
+
+完全一致。**这不是软件 bug 也不是配置问题，是 OFED 版本差一个 minor**。
+
+### 唯一治本方案
+
+**host 升 MLNX_OFED 25.07 → 25.10**：
+
+```bash
+# 在 host 上，root 权限
+sudo apt list --upgradable | grep mlnx       # 看可用版本
+sudo apt install mlnx-ofed-all=25.10-*       # 或对应 DOCA-OFED 包
+sudo /etc/init.d/openibd restart             # 重新加载 mlx5 内核模块
+                                              # 或者直接 reboot 更稳
+ofed_info -s                                  # 验证 → OFED-internal-25.10-*
+
+# 容器内不需要任何改动；DOCA 3.3 已经装好，izzy ext 已经编好。
+# 重连容器后再跑 scripts/smoke_phase6_e2e.py + DOCA 那套，
+# GPU_SM_DB 应该直接 work。
+```
+
+升级窗口：sysadmin 排期。升级过程不影响 host 上跑的 TRT-LLM 容器
+本身（mlx5 模块 reload 时所有走 RDMA 的进程会断一次连，但容器和
+host 文件系统 OK）。
+
+### 给项目交接的人
+
+如果 OFED 升上来之后还要继续：
+
+1. 容器里 `cd /opt/doca_rdma_izzy/build && make` 不用动，已经编好
+2. 调用前 unset `GLUE_RDMA_NIC_HANDLERS` / `GLUE_RDMA_ALLOW_PROXY_HANDLERS`
+   ——让 izzy 走它默认的 `GPU_SM_DB` 路径
+3. 跑两个 endpoint 的 e2e smoke（`/tmp/doca_server_proc.py` +
+   `/tmp/doca_client_proc.py`），看 `rdma stat` 上
+   `mlx5_0/1 rx_write_requests` 是否增加 — 那是判断 NIC 真发包的硬指标
+4. 通了之后再写 `doca_endpoint.py` shim 接入 `IbverbsDraftOffloadConfig`
+   的 `transport="doca"` 选项
+5. 然后恢复 `_run_batch1_graph_fast_path`，把 RDMA round-trip 录进 CUDA graph
+
+软件层全部都准备好了，等的就是 OFED 25.10。

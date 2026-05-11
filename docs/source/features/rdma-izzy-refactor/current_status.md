@@ -386,3 +386,27 @@ nvidia_peermem:      loaded ✓
 Phase 10 是优化路径，软件就绪，等 host OFED 升级即可启用。
 
 推荐 A + C 并行：升级是治本，并行写 software 层不浪费等待时间。
+
+---
+
+## 增补 (post-debug)：Phase 10 根因确认
+
+经多层 debug + 查 NVIDIA DOCA 3.3 release notes，**Phase 10 卡点是 OFED 版本**：
+
+- **Certified**: DOCA 3.3 + ConnectX-7 + B200 sm_100 需要 **MLNX_OFED 25.10**
+- **本机**: MLNX_OFED **25.07**
+- **缺失**: 25.07 没包含 sm_100 GPU Register 直接访问 flag —— 这正是
+  `doca_gpu_verbs_export_qp(GPU_SM_DB)` 的依赖
+- **结论**: 不是软件 bug、不是配置错误、不是 SDK 版本问题（DOCA 3.2/3.3 试过都失败）；
+  唯一治本路径是 host **MLNX_OFED 25.07 → 25.10**
+
+详细见 `phase10_doca_cuda_graph.md` 文末"官方兼容矩阵确认"段。
+
+debug 期间的关键证据：
+
+1. `ibv_reg_mr(GPU_ptr)` 成功 — 数据 P2P (NIC ↔ GPU memory) 已通，nvidia_peermem OK
+2. `doca_gpu_verbs_export_qp(GPU_SM_DB)` 失败 — 控制路径 (GPU SM → NIC BAR) 因 OFED
+   差 minor 版本而 broken
+3. GPU memory dump 显示 WQE 被 GPU kernel 正确写入（producer index +1）
+4. NIC `rx_write_requests` counter 测试前后一致 — NIC 完全不知道有 WQE 等着
+5. 不是 PCIe peer-to-peer 整体不通；是非常具体的"GPU 反向写 NIC doorbell"这一根线
