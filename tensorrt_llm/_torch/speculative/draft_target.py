@@ -281,17 +281,19 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
 
         if self._rdma_offload_enabled:
             if bool(is_warmup):
-                # Warmup: initialize RDMA connection and exercise one real
-                # round-trip (tokens=[] → draft server sees only the prompt).
-                # This pre-warms the QP, GPU buffers, and NIC queues so the
-                # first real decode step does not pay connection-setup latency.
-                # Output history is NOT updated; the result is discarded.
-                self._rdma_draft_client.request(
-                    tokens=[],
-                    position=0,
-                    max_draft_len=self.max_draft_len,
-                    device=logits.device,
-                )
+                # Warmup: initialize RDMA connection so the first real decode
+                # step does not pay connection-setup latency.  v1 does a real
+                # round-trip with empty output_history; v2 only needs the
+                # ``IbverbsDraftOffloadLayer`` to start its channel (lazy
+                # done by the first forward), so we just zero-init the
+                # tensor without hitting the v2 layer.
+                if self._rdma_draft_client is not None:
+                    self._rdma_draft_client.request(
+                        tokens=[],
+                        position=0,
+                        max_draft_len=self.max_draft_len,
+                        device=logits.device,
+                    )
                 next_draft_tokens = torch.zeros(
                     (batch_size, self.max_draft_len), dtype=torch.int32, device=logits.device
                 )
@@ -450,13 +452,28 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
             if request_ids is None or len(request_ids) != int(batch_size):
                 # Fall back to a synthetic request id; v2 needs one per row.
                 request_ids = list(range(int(batch_size)))
+            # ``IbverbsDraftOffloadLayer.forward`` expects exactly one
+            # start-position per request (length == batch_size), but
+            # TRT-LLM passes the *full* per-token position_ids
+            # (length == total prompt+gen tokens in batch).  Build a
+            # per-request position vector — last position is what the
+            # draft side needs to know where to resume from.  Only
+            # batch_size=1 is exercised today (Phase 4 limitation); the
+            # multi-request path lands in Phase 9.
+            if position_ids is None or int(position_ids.numel()) == 0:
+                per_request_positions = torch.zeros(
+                    (int(batch_size),), dtype=torch.int64, device=logits.device
+                )
+            elif int(position_ids.numel()) == int(batch_size):
+                per_request_positions = position_ids.reshape(-1)
+            else:
+                last_pos = int(position_ids.reshape(-1)[-1].detach().cpu().item())
+                per_request_positions = torch.tensor(
+                    [last_pos] * int(batch_size), dtype=torch.int64, device=logits.device
+                )
             return self._rdma_v2_offload_layer(
                 input_ids=accepted_tokens,
-                position_ids=(
-                    position_ids
-                    if position_ids is not None
-                    else torch.zeros((batch_size,), dtype=torch.int64, device=logits.device)
-                ),
+                position_ids=per_request_positions,
                 accepted_tokens=accepted_tokens,
                 num_accepted_tokens=num_accepted_tokens,
                 batch_size=int(batch_size),

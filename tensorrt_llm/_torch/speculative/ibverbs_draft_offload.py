@@ -322,17 +322,36 @@ class IbverbsDraftOffloadLayer(_NN_MODULE_BASE):
         otherwise the draft server has no KV-cache state to step from.
         Idempotent — repeated calls for the same request_id are no-ops
         until the request is unbound / retired.
+
+        The TCP push must use the **slot** (the wire-level identifier
+        carried in imm_data) as the session key, not the logical
+        ``request_id``.  The draft server has no view of the target's
+        request_id namespace — it only ever sees the slot on incoming
+        RDMA packets — so the TCP push and the later RDMA traffic must
+        agree on the slot.  We bind the request first to obtain the
+        slot, then push under that slot.
         """
         if int(request_id) in self._prompt_pushed_requests:
             return
         if self._tcp_prompt_port <= 0:
             raise RuntimeError("tcp_prompt_port not configured; cannot push prompt")
+
+        # Ensure the channel is started and the request has a route bound.
+        self.bind_requests([request_id])
+        route_status, route = self._channel.route_for_request(int(request_id))
+        if route_status != self._channel_cls.Status.kOk or route is None:
+            raise RuntimeError(
+                "Cannot push prompt for request %d: no route bound (%s)"
+                % (request_id, self._channel_cls.to_string(route_status))
+            )
+        wire_handle = int(route.slot)
+
         import json as _json
         import socket as _socket
 
         msg = {
             "msg_type": "prompt_init",
-            "request_id": int(request_id),
+            "request_id": wire_handle,
             "prompt_tokens": [int(t) for t in prompt_tokens],
             "max_draft_len": int(self.config.max_draft_len),
         }

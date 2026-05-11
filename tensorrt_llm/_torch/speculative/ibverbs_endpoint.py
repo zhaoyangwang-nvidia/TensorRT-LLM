@@ -123,7 +123,11 @@ class IbverbsEndpointConfig:
     ib_port: int = 1
     is_server: bool = False  # True ⇒ listen on local_port; False ⇒ connect out
     local_port: int = 0
-    handshake_timeout_s: float = 10.0
+    # Default 120s — long enough for the peer process to finish heavy
+    # startup (e.g. TRT-LLM target loading an 8B model takes ~40s).
+    # The client side typically connects within a few seconds; the server
+    # side may wait longer.
+    handshake_timeout_s: float = 120.0
     wrapper_path: Optional[str] = None  # override path to libibv_wrapper.so
 
 
