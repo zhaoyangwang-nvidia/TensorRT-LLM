@@ -63,6 +63,8 @@ class IbverbsDraftOffloadConfig:
     torch_ops_lib_path: Optional[str] = None
     protocol_max_position: int = (1 << 32) - 1
     protocol_enforce_reserved_zeros: bool = True
+    # Phase 7 TCP prompt-init control channel.  0 = disabled.
+    tcp_prompt_port: int = 0
     # ibverbs-specific knobs:
     is_server: bool = False
     local_port: int = 0
@@ -194,6 +196,11 @@ class IbverbsDraftOffloadLayer(_NN_MODULE_BASE):
         )
         self._cached_routes = {}  # request_id -> Route
         self.last_response_token_counts = None
+        # Phase 7 TCP prefill
+        self._tcp_prompt_host = config.server_host
+        self._tcp_prompt_port = getattr(config, "tcp_prompt_port", 0)
+        self._tcp_prompt_timeout_s = 30.0
+        self._prompt_pushed_requests = set()
 
     # ------------------------------------------------------------------
     # Lifecycle / route management
@@ -237,6 +244,7 @@ class IbverbsDraftOffloadLayer(_NN_MODULE_BASE):
         self._pending_round_seq_by_request.pop(request_id, None)
         self._round_seq_tensor_by_request.pop(request_id, None)
         self._cached_routes.pop(request_id, None)
+        self._prompt_pushed_requests.discard(request_id)
 
     def _bind_route_for_request(self, request_id):
         route_status, route = self._channel.route_for_request(request_id)
@@ -302,6 +310,60 @@ class IbverbsDraftOffloadLayer(_NN_MODULE_BASE):
     def reactivate_requests(self, request_ids):
         for r in dict.fromkeys(int(r) for r in request_ids):
             self._retired_requests.discard(r)
+
+    # ------------------------------------------------------------------
+    # Phase 7: TCP prompt-init control channel
+    # ------------------------------------------------------------------
+
+    def push_prompt(self, request_id, prompt_tokens):
+        """Send a ``TcpPromptInit`` over TCP to the draft server.
+
+        Must be called before the first ``forward`` for the new request,
+        otherwise the draft server has no KV-cache state to step from.
+        Idempotent — repeated calls for the same request_id are no-ops
+        until the request is unbound / retired.
+        """
+        if int(request_id) in self._prompt_pushed_requests:
+            return
+        if self._tcp_prompt_port <= 0:
+            raise RuntimeError("tcp_prompt_port not configured; cannot push prompt")
+        import json as _json
+        import socket as _socket
+
+        msg = {
+            "msg_type": "prompt_init",
+            "request_id": int(request_id),
+            "prompt_tokens": [int(t) for t in prompt_tokens],
+            "max_draft_len": int(self.config.max_draft_len),
+        }
+        sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        sock.settimeout(self._tcp_prompt_timeout_s)
+        try:
+            sock.connect((self._tcp_prompt_host, int(self._tcp_prompt_port)))
+            sock.sendall((_json.dumps(msg) + "\n").encode("utf-8"))
+            chunks = []
+            while True:
+                ch = sock.recv(4096)
+                if not ch:
+                    raise RuntimeError("draft server closed during prompt-init ack")
+                chunks.append(ch)
+                if b"\n" in ch:
+                    break
+            line = b"".join(chunks).split(b"\n", 1)[0]
+            ack = _json.loads(line.decode("utf-8"))
+        finally:
+            sock.close()
+        if ack.get("status") != "ok":
+            raise RuntimeError(
+                "prompt_init failed for request %d: %s" % (request_id, ack.get("error", "unknown"))
+            )
+        self._prompt_pushed_requests.add(int(request_id))
+        _debug_trace(
+            "push_prompt request_id=%s tokens=%d last_pos=%s",
+            request_id,
+            len(prompt_tokens),
+            ack.get("last_token_position", -1),
+        )
 
     # ------------------------------------------------------------------
     # Per-request send / receive
