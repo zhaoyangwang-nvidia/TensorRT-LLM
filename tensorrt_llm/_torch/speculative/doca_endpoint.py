@@ -142,6 +142,18 @@ class _DocaEndpointBackend:
         self._recv_credits = 0
         self._started = False
 
+        # Dedicated sender thread + stream. ``send()`` enqueues the
+        # outgoing 96-byte payload here; the worker thread issues
+        # ``write_with_imm`` on its own CUDA stream so successive sends
+        # don't interleave with TRT-LLM model.forward kernels.
+        self._send_queue = deque()
+        self._send_queue_lock = threading.Lock()
+        self._send_queue_cv = threading.Condition(self._send_queue_lock)
+        self._send_done_cv = threading.Condition()
+        self._send_completed_seq = 0
+        self._send_submitted_seq = 0
+        self._send_thread: Optional[threading.Thread] = None
+
     # ------------------------------------------------------------------
     # Endpoint Protocol
     # ------------------------------------------------------------------
@@ -212,13 +224,20 @@ class _DocaEndpointBackend:
             )
             self._poll_thread.start()
             self._started = True
+            self._send_thread = threading.Thread(
+                target=self._send_worker_loop, name="DocaEp-send", daemon=True
+            )
+            self._send_thread.start()
             return EndpointStatus.kOk
         except Exception:
             self._cleanup()
             return EndpointStatus.kError
 
     def stop(self):
+        self._started = False
         self._progress_stop.set()
+        with self._send_queue_cv:
+            self._send_queue_cv.notify_all()
         self._cleanup()
         self._started = False
         return EndpointStatus.kOk
@@ -248,37 +267,92 @@ class _DocaEndpointBackend:
         if len(payload) != self._cfg.payload_bytes:
             return EndpointStatus.kInvalidPayload
 
-        import torch
-
-        # Pack: 4 byte imm + 96 byte payload + 4 byte signal counter.
         self._send_seq = (self._send_seq + 1) & 0x7FFFFFFF
         imm32 = int(packet.imm_data) & 0xFFFFFFFF
-        # CPU-staged buffer to upload contiguously.
-        frame = bytearray(_IMM_BYTES + DraftApiProtocol.kMessageBytes + _SIGNAL_BYTES)
-        struct.pack_into("<I", frame, 0, imm32)
-        frame[_IMM_BYTES : _IMM_BYTES + DraftApiProtocol.kMessageBytes] = payload
-        struct.pack_into("<I", frame, _IMM_BYTES + DraftApiProtocol.kMessageBytes, self._send_seq)
-        self._send_payload[:_FRAME_BYTES].copy_(torch.frombuffer(frame, dtype=torch.uint8))
-        torch.cuda.synchronize()
+        my_seq = self._send_seq
 
-        remote = self._ep.get_remote_recv_buf(self._cfg.remote_peer_name)
-        local_send = self._ep.get_local_send_buf(self._cfg.remote_peer_name)
-        qp_ptr = self._ep.get_qp_dev_ptr(self._cfg.remote_peer_name)
-        wqe_out = torch.zeros(1, dtype=torch.int64, device=f"cuda:{int(self._cfg.gpu_id)}")
-        # imm_value=0 takes our patched RDMA_WRITE (no IMM) branch.
-        torch.ops.doca_rdma.write_with_imm(
-            qp_ptr,
-            local_send.addr,
-            _FRAME_BYTES,
-            local_send.lkey,
-            remote.addr,
-            remote.rkey,
-            0,
-            wqe_out,
-        )
-        torch.cuda.synchronize()
+        # Hand the WQE to the dedicated sender thread. It runs the
+        # write_with_imm kernel on its own CUDA stream so the SQ submit
+        # never interleaves with kernels that TRT-LLM's model.forward
+        # is queueing on the caller's stream.
+        with self._send_queue_cv:
+            self._send_queue.append((my_seq, imm32, payload))
+            self._send_queue_cv.notify()
+        with self._send_done_cv:
+            deadline = time.monotonic() + 30.0
+            while self._send_completed_seq < my_seq:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return EndpointStatus.kError
+                self._send_done_cv.wait(timeout=remaining)
         self._recv_credits -= 1
         return EndpointStatus.kOk
+
+    def _send_worker_loop(self):
+        """Pop one outgoing packet at a time, run write_with_imm on a
+        dedicated CUDA stream, wait for the kernel, then notify the
+        caller. Single-threaded — guarantees strict round-by-round
+        ordering of WQEs into the SQ.
+
+        The 104-byte frame is written via ``ctypes.memmove`` directly
+        into the host-pinned send buffer (host_ptr == dev_ptr under our
+        ``GLUE_DOCA_HOST_PINNED_BUFFERS=1`` patch), avoiding the
+        ``torch.Tensor.copy_`` path that interacts badly with
+        InferenceMode and TRT-LLM's stream scheduler.
+        """
+        import ctypes
+
+        import torch
+
+        torch.cuda.set_device(int(self._cfg.gpu_id))
+        sender_stream = torch.cuda.Stream(device=int(self._cfg.gpu_id))
+        peer = self._cfg.remote_peer_name
+        send_addr = ctypes.c_void_p(self._send_buf.addr)
+        with torch.inference_mode():
+            while True:
+                with self._send_queue_cv:
+                    while self._started and not self._send_queue:
+                        self._send_queue_cv.wait()
+                    if not self._started:
+                        return
+                    my_seq, imm32, payload = self._send_queue.popleft()
+
+                frame = bytearray(_IMM_BYTES + DraftApiProtocol.kMessageBytes + _SIGNAL_BYTES)
+                struct.pack_into("<I", frame, 0, imm32)
+                frame[_IMM_BYTES : _IMM_BYTES + DraftApiProtocol.kMessageBytes] = payload
+                struct.pack_into("<I", frame, _IMM_BYTES + DraftApiProtocol.kMessageBytes, my_seq)
+                # Host-pinned mapped GPU buffer: ``send_buf.addr`` is the
+                # device pointer == the host pointer under cudaHostAlloc
+                # + cudaHostGetDevicePointer. Writing it from CPU is
+                # safe and visible to the NIC after the SQ DBR ring.
+                src = (ctypes.c_uint8 * _FRAME_BYTES).from_buffer(frame[:_FRAME_BYTES])
+                ctypes.memmove(send_addr, ctypes.addressof(src), _FRAME_BYTES)
+
+                with torch.cuda.stream(sender_stream):
+                    remote = self._ep.get_remote_recv_buf(peer)
+                    local_send = self._ep.get_local_send_buf(peer)
+                    qp_ptr = self._ep.get_qp_dev_ptr(peer)
+                    wqe_out = torch.zeros(
+                        1, dtype=torch.int64, device=f"cuda:{int(self._cfg.gpu_id)}"
+                    )
+                    torch.ops.doca_rdma.write_with_imm(
+                        qp_ptr,
+                        local_send.addr,
+                        _FRAME_BYTES,
+                        local_send.lkey,
+                        remote.addr,
+                        remote.rkey,
+                        0,
+                        wqe_out,
+                    )
+                    sender_stream.synchronize()
+                # Force the wqe_idx readback so the kernel is observed
+                # to have completed before we mark the seq done.
+                _ = int(wqe_out.cpu().item())
+                self._send_submitted_seq = my_seq
+                with self._send_done_cv:
+                    self._send_completed_seq = my_seq
+                    self._send_done_cv.notify_all()
 
     def recv(self):
         if not self._started:
