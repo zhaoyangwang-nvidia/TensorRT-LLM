@@ -1509,7 +1509,7 @@ class DraftTargetDecodingConfig(DecodingBaseConfig):
     # for the spec-decode-over-RDMA progression phase 1 baseline (no RDMA
     # hardware required) and as a correctness reference when the draft
     # backend is being brought up.
-    draft_offload_v2_transport: Literal["ibverbs", "tcp"] = "ibverbs"
+    draft_offload_v2_transport: Literal["ibverbs", "tcp", "doca"] = "ibverbs"
     # When set, the target tells the draft server to lazy-load this model
     # path (via TcpModelInit) so a single bare draft server process can
     # serve different draft models depending on which target connects.

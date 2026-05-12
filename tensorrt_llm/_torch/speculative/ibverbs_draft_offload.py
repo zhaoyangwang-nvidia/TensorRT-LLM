@@ -179,6 +179,24 @@ class IbverbsDraftOffloadLayer(_NN_MODULE_BASE):
                 payload_bytes=DraftApiProtocol.kMessageBytes,
             )
             self._endpoint = _TcpRdmaBackend(tcp_cfg)
+        elif config.transport == "doca":
+            from .doca_endpoint import DocaEndpointConfig, _DocaEndpointBackend
+
+            # ``CUDA_VISIBLE_DEVICES`` already masks the visible GPU, so
+            # torch sees the worker's chosen device as index 0. izzy's
+            # init() takes the masked index.
+            doca_cfg = DocaEndpointConfig(
+                gpu_id=0,
+                nic_name=config.nic_name,
+                is_server=config.is_server,
+                remote_host=config.server_host,
+                remote_port=config.server_port,
+                bind_port=config.local_port or config.server_port,
+                remote_peer_name=config.remote_peer_name,
+                recv_queue_depth=config.max_num_requests,
+                payload_bytes=DraftApiProtocol.kMessageBytes,
+            )
+            self._endpoint = _DocaEndpointBackend(doca_cfg)
         else:
             from .ibverbs_endpoint import IbverbsEndpointConfig, _IbverbsRdmaBackend
 
@@ -239,11 +257,13 @@ class IbverbsDraftOffloadLayer(_NN_MODULE_BASE):
     def _ensure_started(self):
         if self._started:
             return
-        # Order matters when transport=tcp: tell the draft server which
-        # model to load FIRST (slow — minutes for an 8B model), then open
-        # the data-plane socket. Otherwise data-plane connect() races a
-        # not-yet-ready draft.
-        if self.config.transport == "tcp" and self.config.draft_model_path:
+        # Order matters when transport is tcp/doca: tell the draft
+        # server which model to load FIRST (slow — minutes for an 8B
+        # model), then open the data-plane socket. Otherwise data-plane
+        # connect() races a not-yet-ready draft. ibverbs uses the
+        # pre-loaded ``draft_rdma_server_v2.py --model ...`` pattern, so
+        # ModelInit is skipped there.
+        if self.config.transport in ("tcp", "doca") and self.config.draft_model_path:
             self._push_tcp_model_init()
         status = self._channel.start()
         if status != self._channel_cls.Status.kOk:
