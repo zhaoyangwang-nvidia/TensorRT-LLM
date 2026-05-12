@@ -373,6 +373,84 @@ the bug — that piece is now demonstrably correct for one full
 round-trip. The remaining work is entirely in the izzy WQE
 submission kernel.
 
+### 2026-05-12 follow-up (third pass): izzy kernel is actually fine
+
+The third debug pass revised the previous conclusion. The previous
+pass said "the bug is in izzy's WQE submit kernel." That turned out
+to be wrong. A minimal synthetic two-process harness
+(`doca_rdma_izzy_work/test_multi_send.py`) calls
+`torch.ops.doca_rdma.write_with_imm` `N` times in a tight loop, with
+optional matmul-heavy compute inserted between calls to mimic
+TRT-LLM's verify forward.
+
+Findings:
+
+* **`N=4`, no intervening compute → all 4 writes land at the
+  receiver.** Server log:
+  ```
+  [server] recv first_byte transitioned 0 → 1 buf[0:8]=[1,1,1,1,1,1,1,1]
+  [server] recv first_byte transitioned 1 → 2 buf[0:8]=[2,2,2,2,2,2,2,2]
+  [server] recv first_byte transitioned 2 → 3 buf[0:8]=[3,3,3,3,3,3,3,3]
+  [server] recv first_byte transitioned 3 → 4 buf[0:8]=[4,4,4,4,4,4,4,4]
+  ```
+* **`N=4`, with `~1 s` of fp16 matmul between each send → 3 of 4
+  land, the trailing one is dropped.** The exact "lost the last
+  round" pattern that TRT-LLM hits at round 2.
+
+So the izzy `rdma_write_imm_kernel` correctly drives `submit(qp, 2)`,
+`submit(qp, 3)`, etc. The CPU-proxy template hypothesis from the
+2026-05-12 follow-up above was wrong — the kernel is multi-call safe
+on this hardware. The `[progress transition]` dbg in
+`cpu_proxy_progress` *is* unreliable, but only because the dbg
+counter caps before the second transition lands; the wire delivery
+itself succeeds in the synthetic test.
+
+Verified that the in-TRT-LLM failure is **not**:
+
+* CUDA-stream juggling between TRT-LLM forward passes. Pinning the
+  endpoint to its own `torch.cuda.Stream` for every `write_with_imm`
+  did not change the failure.
+* The CPU progress daemon getting starved. Calling
+  `cpu_proxy_progress(...)` inline 64 times right after each submit
+  did not change the failure.
+* Draft-side compute. Swapping the trtllm draft for a `--backend mock`
+  draft (no model load, no torch compute) still loses round 2.
+
+So the wire write for round 2 leaves the SQ on the target side, but
+something inside the **target process** (between rounds 1 and 2)
+either corrupts the SQ memory, races against the DOCA QP state
+machine, or otherwise prevents the second WQE from clearing the NIC.
+The synthetic test reproduces "drop the last round" only with heavy
+intervening compute on the *same GPU as the sending NIC*, which
+strongly suggests a memory-ordering or page-migration interaction
+between torch's caching allocator (which keeps churning the GPU heap
+during model forward) and the DOCA-owned SQ memory page — even with
+`GLUE_DOCA_HOST_PINNED_BUFFERS=1` on the *buffers*, the SQ memory
+itself is still GPU-resident DOCA memory and remains exposed.
+
+Concrete next experiments (each ~30 min of work):
+
+1. **Allocate the SQ in host-pinned memory too.** Today only the send
+   and recv data buffers are host-pinned via `cudaHostAlloc`. The QP
+   metadata / WQE ring is still allocated by
+   `doca_gpu_mem_alloc(GPU)` inside DOCA. Mapping the SQ region to
+   host pinned would close the same fault path the
+   2026-05-12 host-pinned-buffer fix closed for the *data* path.
+   Requires a DOCA-level option (`doca_gpu_verbs_qp_attr_set_*`)
+   plumb-through that may or may not exist.
+2. **Pre-warm torch's caching allocator before DOCA init.** Allocate
+   a single ~30 GiB tensor on the target GPU, free it, then init the
+   DOCA endpoint. Subsequent torch allocations stay inside the
+   pre-grown slab and don't race with DOCA pages.
+3. **Phase-9 multi-process split.** Move the DOCA endpoint into a
+   separate process with shared-memory IPC to TRT-LLM. The synthetic
+   test confirms a torch-free process can drive `write_with_imm` at
+   arbitrary cadence; this is the most robust path forward.
+
+Revised conclusion: izzy kernel is **not** the bug. The remaining
+work is on the target-process memory-isolation side (host-pinning
+the SQ, allocator pre-warm, or two-process split).
+
 ## Fix paths (any one unblocks phase 3)
 
 In rough effort order:
