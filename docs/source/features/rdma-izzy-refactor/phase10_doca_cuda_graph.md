@@ -605,3 +605,120 @@ follow-up（recv-WR posting for CPU_PROXY responder）解了之后做。
 
 当前 land 的成果限定在「**单向 GPU 主动发 RDMA WRITE + CPU_PROXY
 doorbell**」这一段链路，不假装把投机解码全打通。
+
+---
+
+## 增补 3：投机解码协议层 e2e（2026-05-12，mock backend）
+
+为了把 CPU_PROXY 链路抽象成可重用的传输，把 WRITE_WITH_IMM responder
+端 recv-WR 这层卡死的问题用 **polling-based notification** 绕开：
+
+* 每个 recv buffer 在 96-byte 协议消息后跟一个 4-byte ``signal word``。
+* 发送端把 96B payload + signal++ 放进同一个写区，issue **单个
+  RDMA_WRITE**（plain，不带 IMM）。
+* MLX5 responder 按地址递增顺序写入；接收端轮询 signal word，看到
+  变化即可读完整 payload。
+* 不需要 posted recv WR，不需要 IMM，不需要 send CQ poll on critical
+  path。
+
+实现位于 ``examples/llm-api/rdma/doca_poll_channel.py``，封装为
+``DocaPollChannel.send_msg(96B) / recv_msg() -> 96B``。配套
+``doca_pingpong_smoke.py`` / ``doca_draft_server.py`` /
+``doca_target_client.py``。
+
+### 验证
+
+| 测试 | 拓扑 | 结果 |
+|---|---|---|
+| ping-pong 96B 双向 | GPU 0/mlx5_0 ↔ GPU 1/mlx5_1 | ✅ 多轮全过 |
+| ping-pong | GPU 2/mlx5_0 ↔ GPU 3/mlx5_1 | ✅ |
+| Draft API 96-byte spec-dec 协议 / mock backend 3 轮 | GPU 2/mlx5_0 ↔ GPU 3/mlx5_1 | ✅ Target 累积 12 个 draft tokens，draft 端 round_seq / position / last_token 验证全对 |
+
+### 仍未跑通：真模型 backend e2e
+
+把 draft backend 从 ``mock`` 换成 ``transformers`` (Qwen3-0.6B 真生成)，
+跑同样 3 轮：**第 0 轮 draft 发不出消息**。
+
+* draft 的 ``send_msg`` 完成（``send_buf[0:16]`` 内容验证正确为
+  ``DraftToTarget`` 帧，CPU 进度线程也观察到 prod 从 0 → 1 并把
+  DBR 写成 ``0x01000000``）
+* 但 target 一侧 ``recv_buf`` 始终为 0，signal word 不变，``recv_msg``
+  超时
+* 同一份代码，draft backend 改回 ``mock`` 立刻通过
+* 反向 (target → draft) 的写一直 OK，所以不是 channel 的 send 逻辑
+  问题
+
+最可能的根因（未确认）：``transformers`` 走的 torch caching allocator
+跟 DOCA 自己的 ``doca_gpu_mem_alloc`` 池在同一片 CUDA 虚地址里抢空间，
+模型权重/中间张量覆盖了 ``QP`` 或 ``CQ`` 的某段 GPU buffer，导致
+NIC 取 WQE 时拿到垃圾、静默丢包。``send CQ`` 上也没出 error CQE
+（只看到初始 ``0xf1`` invalid，意味着 NIC 根本没写 CQE）。
+
+为什么 mock 没问题：``_MockBackend`` 不调 CUDA，torch 那边只走 Python
+基础结构，分配器没被驱动到跟 DOCA 抢页。
+
+容器里没有 ``tensorrt_llm`` wheel（``devel`` build container），所以
+``--backend trtllm`` 这次没有现场复测；但底层都用 torch caching
+allocator，估计现象一样。
+
+### 现状
+
+| 任务 | 状态 |
+|---|---|
+| CPU_PROXY 单向 RDMA_WRITE 数据落对端 | ✅ |
+| ``DocaPollChannel`` 双向收发 | ✅ |
+| 96-byte Draft API 协议跑通 3 轮 mock | ✅ |
+| Draft 后端切到真模型 (transformers / trtllm) | ❌ —— torch allocator vs DOCA GPU pool 冲突 |
+| 真正的 spec-dec target ↔ draft e2e | ❌ —— 取决于上一项 |
+
+### 给后续
+
+要把真模型 e2e 拿下，下一步按收益排序：
+
+1. **隔离 GPU 内存池**：要么把 DOCA buffer 放在一段 torch 不会去
+   触碰的虚地址（先在 torch 这边预占大块再 release，或显式 set
+   allocator 限制），要么 izzy 内部把 QP / CQ / buffer 改用
+   ``cudaHostAlloc`` + ``cudaHostGetDevicePointer``（host pinned
+   映射进 GPU 地址空间，物理上跟 torch 分开）。前者实现轻，后者
+   延迟会差一些但 robust。
+2. **复测 trtllm backend**：先把 ``tensorrt_llm`` wheel 装进容器，
+   跑 ``doca_draft_server.py --backend trtllm``，确认是不是 PyTorch
+   allocator 通病。
+3. **抓 nsys / ncu trace**：定位被 NIC 取到的 WQE 实际指向哪片 GPU
+   内存、那片内存的 owner 是 torch 还是 DOCA。
+4. **fallback**：两进程方案——backend 跑 process A (GPU N)，channel
+   跑 process B (GPU M)，A↔B 之间用 IPC 搬 token。延迟和实现都
+   不太好看，但避开同进程 allocator 冲突。
+
+### 复现
+
+mock 这条通路：
+
+```bash
+# draft on GPU 2 / mlx5_0
+GPU_ID=2 NIC=mlx5_0 PORT=47860 \
+  GLUE_RDMA_ALLOW_PROXY_HANDLERS=1 GLUE_RDMA_NIC_HANDLERS=1 \
+  PYTHONPATH=/opt/doca_rdma_izzy/build:examples/llm-api/rdma \
+  python3 examples/llm-api/rdma/doca_draft_server.py \
+    --backend mock --max-draft-len 4 --rounds 3
+
+# target on GPU 3 / mlx5_1 (different terminal)
+GPU_ID=3 NIC=mlx5_1 PORT=47860 HOST=127.0.0.1 \
+  GLUE_RDMA_ALLOW_PROXY_HANDLERS=1 GLUE_RDMA_NIC_HANDLERS=1 \
+  PYTHONPATH=/opt/doca_rdma_izzy/build:examples/llm-api/rdma \
+  python3 examples/llm-api/rdma/doca_target_client.py \
+    --rounds 3 --max-draft-len 4
+```
+
+transformers 失败的跑法（同上，draft 命令替换为）：
+
+```bash
+... doca_draft_server.py --backend transformers \
+    --model <Qwen3-0.6B path> \
+    --prompt "Explain GPUDirect RDMA in one short sentence." \
+    --max-draft-len 4 --rounds 3
+```
+
+第 0 轮 draft 端会成功打印 ``[draft] round 0 sent DraftToTarget
+tokens=[...]``，但 target 端 ``recv_msg`` 永远等不到 signal 变化，
+``[target] DONE`` 出不来。
