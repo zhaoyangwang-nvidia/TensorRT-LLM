@@ -276,6 +276,103 @@ Most likely candidates for the new failure (none confirmed):
 This is a layer-above-transport debugging task; the wire side is now
 clean.
 
+### 2026-05-12 follow-up: confirmed it is a send-side regression at round 2
+
+A second debug pass narrowed the failure precisely. Instrumented
+`_DocaEndpointBackend.send`, `IbverbsDraftOffloadLayer._send_requests`,
+and the layer's `_receive_responses` entry point, and re-ran the
+same launch.
+
+Per-round trace (Qwen3-4B target + Qwen3-0.6B draft, both with
+`GLUE_DOCA_HOST_PINNED_BUFFERS=1`, single request id=2048):
+
+```
+# round 1 (prefill step)
+[_send_requests ENTRY] request_ids=[2048] start_positions=[11] num_accepted=[1]
+[doca send ENTRY]     started=True credits=4096 imm=0x80000001 send_seq=0
+[doca send DONE]      wqe_out=0 send_seq=1 credits_left=4095
+[recv_responses ENTRY] request_ids=[2048] pending=[2048]
+[doca poll_once] kOk inbox_len=1                              ← round-1 reply arrives
+                                                              ← _receive_responses returns
+
+# round 2 (next generation step, same request)
+[_send_requests ENTRY] request_ids=[2048] start_positions=[16] num_accepted=[5]
+[doca send ENTRY]     started=True credits=4096 imm=0x80000001 send_seq=1
+[doca send DONE]      wqe_out=1 send_seq=2 credits_left=4095   ← second WQE *placed* in SQ
+[recv_responses ENTRY] request_ids=[2048] pending=[2048]
+… 2 s of polling, every call returns kEndpointEmpty …
+RuntimeError: Timed out waiting for draft offload responses (pending=[2048], timeout_s=2.0)
+```
+
+So `_receive_responses` IS called twice — once per round-trip — and
+the first round completes fully. Earlier readings that suggested
+"the packet was consumed but the layer didn't see it" were
+mis-pattern-matched: the kOk we saw was round 1's reply, the
+subsequent kEndpointEmpty flood is round 2 waiting for a reply that
+never lands.
+
+The reply never lands because the **second `RDMA_WRITE` never reaches
+the wire**. On the target, izzy's CPU-proxy diagnostic shows the SQ
+producer counter transitioning only `0 → 1`; the doorbell record
+stabilises at `*DBR=0x01000000` (big-endian SQ pi = 1) and never
+advances to `0x02000000` even after `write_with_imm` returns
+`wqe_out=1` for round 2. On the draft, the receive-signal counter
+stays at 1 — no second packet arrives — so `[draft][doca] round=N`
+is logged for `N=1` only.
+
+Concretely, on the target this round-2 send dbg fires:
+
+```
+[doca send DONE] wqe_out=1 send_seq=2 credits_left=4095
+```
+
+immediately followed by 2 seconds of polls on a recv buffer that
+never updates. izzy's `cpu_proxy_progress` only emits 10 dbg events
+per thread before capping, so the absence of a "[progress
+transition] prod=2" line in our current logs is not proof on its
+own; the conclusive signal is the stable `*DBR=0x01000000` across all
+8 visible post events and the fact that draft never sees the second
+write.
+
+What this likely is (in rough order of probability):
+
+1. **izzy's `rdma_write_imm_kernel` cadence assumption.** The
+   kernel calls `doca_gpu_dev_verbs_reserve_wq_slots(qp, 1)` +
+   `submit(qp, wqe_idx + 1)`. If `submit` is templated to GPU-SM-DB
+   semantics by default (which we believe is the case in this build)
+   the second call may be a no-op against a doorbell BAR that
+   `MLNX_OFED 25.07` does not expose to the GPU. Round 1 happened
+   to succeed only because the *first* doorbell write piggy-backs on
+   the initial QP-to-RTS state set by `doca_gpu_dev_verbs_export_qp`;
+   subsequent submits are silently lost. Verifying this is a 30-line
+   kernel patch that explicitly templates `submit<…
+   DOCA_GPUNETIO_VERBS_NIC_HANDLER_CPU_PROXY …>` (or AUTO) and a
+   rerun. The kernel source is in
+   `doca_rdma_izzy_work/src/doca_rdma_torch_ops.cu`.
+2. **Send-CQ not drained between rounds.** The kernel does not
+   `wait_send_completion` after submit; if CPU-proxy requires the
+   prior CQE to be reaped before honouring a new doorbell ring, the
+   second submit would stall. Cheap to test: add an explicit
+   `poll_send_cq` after each `write_with_imm` and see if round 2
+   moves.
+3. **Buffer-aliasing on the second send.** Both rounds write to the
+   same 104-byte staging slice of `_send_payload`. If DOCA caches the
+   physical address-translation table per WQE on the first ring, the
+   second WQE could end up pointing at a stale page (less likely
+   given the buffer is host-pinned and ibv-MR-registered, but worth
+   a quick byte dump of the SQ memory after round 2's submit).
+
+Next step (when picking this up): add the explicit CPU-PROXY
+template to `rdma_write_imm_kernel`'s `submit` call and a
+`wait_send_completion` between rounds 1 and 2; rerun the same
+target/draft pair and check whether the SQ DBR advances to
+`*DBR=0x02000000` and whether draft logs `round=2`.
+
+The TRT-LLM-side code path (layer + channel + endpoint) is **not**
+the bug — that piece is now demonstrably correct for one full
+round-trip. The remaining work is entirely in the izzy WQE
+submission kernel.
+
 ## Fix paths (any one unblocks phase 3)
 
 In rough effort order:
