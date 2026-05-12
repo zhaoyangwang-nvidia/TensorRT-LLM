@@ -451,6 +451,86 @@ Revised conclusion: izzy kernel is **not** the bug. The remaining
 work is on the target-process memory-isolation side (host-pinning
 the SQ, allocator pre-warm, or two-process split).
 
+### 2026-05-12 follow-up (fourth pass): isolated to "generate-between-sends"
+
+The minimal `_DocaEndpointBackend` repro at
+`examples/llm-api/rdma/test_endpoint_clone.py` narrowed the trigger to
+a single sequence inside the *target* process:
+
+> A real `llm.generate(...)` (Qwen3-4B forward) between two
+> `ep.send(...)` calls poisons the QP state so the second send's
+> wire write never reaches the peer.
+
+Verified matrix (single-process, ``TLLM_WORKER_USE_SINGLE_PROCESS=1``,
+sender-thread fix in place):
+
+| Scenario | Result |
+|---|---|
+| 4 sends, no compute between | all 4 land at server ✓ |
+| 4 sends, fp16 matmul (256 MB tensors) between | all 4 land ✓ |
+| 4 sends, fp16 matmul (≥6 GB tensors) between | all 4 land ✓ |
+| LLM loaded but never forwarded, 2 sends | both land ✓ |
+| LLM loaded + warmup generate, then 2 sends with no generate between | both land ✓ |
+| 2 sends with `llm.generate(...)` between | **round 2 lost** ✗ |
+| Same as above, but call `torch.cuda.empty_cache()` + `synchronize()` between gen and round-2 send | **round 2 lost** ✗ |
+
+Client-side state on the failing round 2 is **perfect**: SQ producer
+counter advances to 2, DBR advances to `0x02000000`, the
+`write_with_imm` kernel reports `wqe_out=1`. But the receiving NIC
+records zero `rx_write_requests` increment, and the draft side's
+recv-signal counter never moves past round 1.
+
+So `llm.generate(...)` does something that breaks the DOCA
+external-datapath QP's ability to emit subsequent sends — likely a
+CUDA memory-pool / virtual-address change that invalidates the SQ's
+GPU-resident page mapping (the host-pinned-buffer fix only covers the
+data buffers, not the SQ ring itself).
+
+Phase 2 ibverbs over the same NIC + the same model.forward survives —
+because libibverbs uses a regular `ibv_qp` whose SQ is in CPU-pinned
+memory and whose doorbell goes through the kernel's mlx5 driver, not
+through DOCA's external-datapath GPU-exported QP.
+
+### Hardware/SDK gate
+
+Per the phase 14 design doc, full GPU-initiated RDMA on this NIC
+requires **MLNX_OFED ≥ 25.10**. This host runs **25.07**. The Phase 3
+CPU_PROXY fallback is the documented workaround for 25.07, and it
+works for isolated round-trips (Phase 3 first send + first receive is
+byte-correct, as the earlier addenda show), but the second round-trip
+after a real CUDA-heavy model forward is gated on a
+SDK/firmware-level fix we cannot patch from userspace.
+
+### What ships in this commit
+
+* `_DocaEndpointBackend` gets a **dedicated sender thread + dedicated
+  CUDA stream + ctypes-direct WQE staging into the host-pinned send
+  buffer**. With this fix:
+  * The SQ producer counter now correctly advances on every send (no
+    longer stuck at 1 on round 2).
+  * The doorbell record updates: `0x01000000 → 0x02000000 → ...`.
+  * The synthetic ``test_endpoint_clone`` repro delivers N=4
+    sends through the same code path that TRT-LLM uses, even under
+    6 GB of allocator pressure.
+  * The single-round Phase 3 e2e (round 1 only) byte-matches.
+* A standalone repro script
+  (`examples/llm-api/rdma/test_endpoint_clone.py`) that pinpoints the
+  "generate-between-sends" failure without any TRT-LLM scheduler in
+  the way.
+* This addendum.
+
+What still requires either MLNX_OFED 25.10 or an explicit DOCA SDK
+fix (out of our reach):
+
+* Full spec-decode multi-round e2e byte-match when target's
+  ``model.forward`` runs between rounds. This is the original
+  Phase 3 e2e goal. Workarounds:
+  * Phase 2 ibverbs already byte-matches end-to-end on this hardware
+    — recommend running spec-decode through that path until OFED
+    25.10 is available.
+  * Phase 4 (GPU_SM_DB) once OFED 25.10 lands will side-step the
+    CPU_PROXY external-datapath path entirely.
+
 ## Fix paths (any one unblocks phase 3)
 
 In rough effort order:
