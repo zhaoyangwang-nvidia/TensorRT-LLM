@@ -200,6 +200,82 @@ runs **do** produce that sequence; the wire format and verify logic
 are unchanged here, so once the memory-pool issue is solved we expect
 the same byte-match.
 
+## Addendum: host-pinned DOCA buffer patch (2026-05-12)
+
+Implemented fix path 1 above. Lands as an opt-in flag (env var
+``GLUE_DOCA_HOST_PINNED_BUFFERS=1``) on izzy's
+``alloc_doca_gpu_buffer`` so the rest of the izzy + DOCA SDK stack is
+unaffected when the flag is off.
+
+### What the patch does
+
+In `doca_rdma_endpoint.cpp::alloc_doca_gpu_buffer`, when the env flag
+is set, instead of calling `doca_gpu_mem_alloc(GPU)`:
+
+* `cudaHostAlloc(host_ptr, size, cudaHostAllocMapped | cudaHostAllocPortable)`
+  to get pinned host RAM with a device-mapped view.
+* `cudaHostGetDevicePointer(&dev_ptr, host_ptr, 0)` to get the UVA
+  address (in our environment this returns the same pointer as
+  `host_ptr` — true UVA).
+* `ibv_reg_mr(pd, host_ptr, aligned, ...)` to register the host pinned
+  range with the NIC (regular MR, not dmabuf — the OS-pinned host page
+  is rock-stable, no driver migration concern).
+* Return `BufferInfo{addr=dev_ptr, lkey=mr->lkey, rkey=mr->rkey}` so
+  the rest of the stack treats it as a normal GPU buffer.
+
+Both processes (target and draft) must run with the flag for the fix
+to apply to both directions.
+
+### What now works
+
+End-to-end test in the new mode (target Qwen3-4B on GPU 1 / mlx5_1,
+draft Qwen3-0.6B on GPU 0 / mlx5_0, both with `GLUE_DOCA_HOST_PINNED_BUFFERS=1`):
+
+* The draft side issues an `RDMA_WRITE` (via DOCA CPU_PROXY GPU
+  kernel) and the bytes **arrive at the right physical address** in
+  target's recv buffer:
+
+  ```
+  [doca-poll dbg] last_seen=1 cur=1
+    recv[0:16]=[0, 0, 0, 128, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 4, 0]
+    addr=0x73ddc143cc00
+  ```
+
+  Decoded: `imm_data=0x80000000` (msg_type=kDraftToTarget, slot=2048),
+  `round_seq_num=1`, `position=0`, `version=1`, `message_type=0`,
+  `num_tokens=4`. This is the correct DraftToTarget reply.
+
+* `_DocaEndpointBackend.recv()` successfully returns the
+  EndpointPacket to the SpecDecodeChannel layer.
+
+So the physical-page-migration root cause that motivated this fix is
+**resolved**: the bytes do land in the right place on the receiver
+side now. ✓
+
+### Remaining gap (different symptom, different layer)
+
+Despite the recv buffer holding the correct payload and the endpoint
+returning it to the channel, TRT-LLM's `_receive_responses` still
+times out with `pending=[2048]`. The packet appears to be consumed
+exactly once but the spec-decode layer doesn't match it against the
+pending request.
+
+Most likely candidates for the new failure (none confirmed):
+
+1. `SpecDecodeChannel.pump_once_for_bound_request` returns a status
+   other than `kOk` (e.g., the protocol validation in `channel.recv`
+   rejects the 96-byte payload because of a subtle field encoding
+   issue introduced by our 4-byte imm-prefix wire frame). Adding a
+   print inside the channel would settle this in a few minutes.
+2. Race between `_DocaEndpointBackend`'s poll thread and the
+   spec-decode main thread on the inbox / `_recv_credits` state.
+3. A second consumer somewhere in TRT-LLM is draining our inbox
+   before `_receive_responses` runs (e.g., a credit-refresh poll in
+   `_send_requests` — though we haven't found one).
+
+This is a layer-above-transport debugging task; the wire side is now
+clean.
+
 ## Fix paths (any one unblocks phase 3)
 
 In rough effort order:

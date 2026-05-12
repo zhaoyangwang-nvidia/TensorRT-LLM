@@ -1,4 +1,4 @@
-# DOCA CPU_PROXY support on top of izzy doca_rdma (pearl-izzy branch)
+# DOCA CPU_PROXY support + host-pinned buffer path for izzy doca_rdma
 #
 # Apply with:
 #     cd /opt/doca_rdma_izzy && patch -p1 < .../01-cpu-proxy-mode.patch
@@ -19,6 +19,12 @@
 #   for external-datapath QPs; see follow-up task tracking).
 # - Build fixes already in phase10 doc but consolidated here for one-shot
 #   apply: ::listen namespace qualifier; CMakeLists pybind LTO off.
+# - Host-pinned buffer path (env GLUE_DOCA_HOST_PINNED_BUFFERS=1):
+#   alloc_doca_gpu_buffer takes cudaHostAlloc+cudaHostGetDevicePointer+
+#   ibv_reg_mr path instead of doca_gpu_mem_alloc+dmabuf. Sidesteps the
+#   torch caching allocator vs DOCA GPU mem pool page-migration conflict
+#   that breaks the receive direction when TRT-LLM lives in the same
+#   process as the DOCA endpoint. See phase13_doca_cpu_proxy.md.
 
 --- a/doca_rdma/CMakeLists.txt
 +++ b/doca_rdma/CMakeLists.txt
@@ -190,7 +196,77 @@
      return true;
  }
  
-@@ -1693,3 +1747,119 @@
+@@ -1661,6 +1715,69 @@
+         return info;
+     }
+ 
++    // Co-existence with PyTorch / TRT-LLM in the same process: when the
++    // caller opts in via ``GLUE_DOCA_HOST_PINNED_BUFFERS=1`` we allocate
++    // the buffer in host-pinned RAM and hand the device-mapped pointer
++    // out as if it were GPU memory. The NIC accesses it via dmabuf
++    // registration against the host-pinned page (OS pinned, can't be
++    // migrated), while the GPU kernel sees a normal GPU virtual address.
++    // This sidesteps the torch caching allocator vs DOCA GPU mem pool
++    // page-migration conflict observed in ``phase13_doca_cpu_proxy.md``.
++    {
++        char const* env = std::getenv("GLUE_DOCA_HOST_PINNED_BUFFERS");
++        bool host_pinned = env && (env[0] == '1' || env[0] == 'y' || env[0] == 'Y');
++        if (host_pinned)
++        {
++            // Round up to page so the dmabuf FD covers the whole alloc;
++            // matches what register_buffer does for the GPU path.
++            size_t page = get_page_size();
++            size_t aligned = ((length + page - 1) / page) * page;
++            void* host_ptr = nullptr;
++            cudaError_t cerr = cudaHostAlloc(
++                &host_ptr, aligned, cudaHostAllocPortable | cudaHostAllocMapped);
++            if (cerr != cudaSuccess || host_ptr == nullptr)
++            {
++                DOCA_LOG_ERR("cudaHostAlloc(%zu) failed: %s",
++                    aligned, cudaGetErrorString(cerr));
++                return info;
++            }
++            std::memset(host_ptr, 0, aligned);
++            void* dev_ptr = nullptr;
++            cerr = cudaHostGetDevicePointer(&dev_ptr, host_ptr, 0);
++            if (cerr != cudaSuccess || dev_ptr == nullptr)
++            {
++                cudaFreeHost(host_ptr);
++                DOCA_LOG_ERR("cudaHostGetDevicePointer failed: %s",
++                    cudaGetErrorString(cerr));
++                return info;
++            }
++            // Register MR against the host-pinned mapping. The NIC then
++            // DMAs to/from host RAM (over PCIe), but GPU kernels still
++            // see ``dev_ptr`` as a normal GPU VA via UVA.
++            ibv_mr* mr = ibv_reg_mr(doca_state_->pd, host_ptr, aligned,
++                IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ
++                    | IBV_ACCESS_REMOTE_ATOMIC);
++            if (!mr)
++            {
++                cudaFreeHost(host_ptr);
++                DOCA_LOG_ERR("ibv_reg_mr (host pinned) failed: errno=%d (%s)",
++                    errno, strerror(errno));
++                return info;
++            }
++            // Track the host alloc so ``deregister_buffer`` can free it.
++            doca_state_->doca_buffers.push_back(
++                {host_ptr, aligned, mr, "host_pinned"});
++            info.addr = (uint64_t) dev_ptr;
++            info.length = length;
++            info.lkey = mr->lkey;
++            info.rkey = mr->rkey;
++            info.buf_arr_index = -1;
++            DOCA_LOG_INFO("Host-pinned DOCA buffer: dev=%p host=%p len=%zu lkey=0x%x rkey=0x%x",
++                dev_ptr, host_ptr, length, info.lkey, info.rkey);
++            return info;
++        }
++    }
++
+     // Allocate GPU memory using DOCA
+     void* gpu_ptr = nullptr;
+     doca_error_t result = doca_gpu_mem_alloc(doca_state_->gpu, length, 4096, DOCA_GPU_MEM_TYPE_GPU, &gpu_ptr, nullptr);
+@@ -1693,3 +1810,119 @@
  {
      return accept_peer(port, "rdma_peer");
  }

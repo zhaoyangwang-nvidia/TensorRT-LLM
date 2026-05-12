@@ -300,9 +300,10 @@ class _DocaEndpointBackend:
                 return
 
     def _poll_loop(self):
-        # Spins on the trailing signal of the recv buffer. When it
-        # changes, copy the 100-byte head (imm + payload) into the
-        # inbox.
+        # Spins on the trailing signal of the recv buffer. When the
+        # signal counter advances, the responder's RC ordering
+        # guarantees the imm_data + payload bytes are already in
+        # memory, so we pop the head and push as an EndpointPacket.
         while not self._progress_stop.is_set():
             try:
                 cur = int(self._recv_signal.cpu().item())
