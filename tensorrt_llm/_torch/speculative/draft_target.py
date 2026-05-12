@@ -146,6 +146,23 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
                             getattr(spec_config, "draft_offload_v2_max_num_requests", 256)
                         ),
                         max_draft_len=int(spec_config.max_draft_len),
+                        transport=str(
+                            getattr(spec_config, "draft_offload_v2_transport", "ibverbs")
+                        ),
+                        draft_model_path=getattr(
+                            spec_config, "draft_offload_v2_model_path", None
+                        ),
+                        draft_model_dtype=str(
+                            getattr(spec_config, "draft_offload_v2_model_dtype", "bfloat16")
+                        ),
+                        draft_kv_cache_free_fraction=float(
+                            getattr(
+                                spec_config, "draft_offload_v2_kv_cache_free_fraction", 0.4
+                            )
+                        ),
+                        tcp_prompt_port=int(
+                            getattr(spec_config, "draft_offload_v2_tcp_prompt_port", 0)
+                        ),
                     )
                 )
                 logger.info(
@@ -305,6 +322,8 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
                     logits=logits,
                     batch_size=batch_size,
                     request_ids=getattr(spec_metadata, "request_ids", None),
+                    input_ids=input_ids,
+                    attn_metadata=attn_metadata,
                 )
             next_new_tokens = self._prepare_next_new_tokens(
                 accepted_tokens,
@@ -444,6 +463,8 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
         logits: torch.Tensor,
         batch_size: int,
         request_ids: Optional[list] = None,
+        input_ids: Optional[torch.Tensor] = None,
+        attn_metadata: Optional["AttentionMetadata"] = None,
     ) -> torch.Tensor:
         # V2 path: izzy-compatible 96-byte WRITE_WITH_IMM via
         # ``IbverbsDraftOffloadLayer``.  All bookkeeping (round_seq,
@@ -471,6 +492,42 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
                 per_request_positions = torch.tensor(
                     [last_pos] * int(batch_size), dtype=torch.int64, device=logits.device
                 )
+
+            # Auto prompt push on context phase: when ``num_contexts > 0``
+            # the request is being prefilled on the target side this step,
+            # so the draft side must also prefill before the first round
+            # trip lands. We push the full prompt token sequence for each
+            # context row. Batch_size==1 today (see the multi-request
+            # caveat above); the multi-row generalization slices
+            # ``input_ids`` by ``attn_metadata.seq_lens[:num_contexts]``.
+            if attn_metadata is not None and input_ids is not None:
+                num_contexts = int(getattr(attn_metadata, "num_contexts", 0))
+                if num_contexts > 0:
+                    flat = input_ids.reshape(-1)
+                    seq_lens = getattr(attn_metadata, "_seq_lens", None)
+                    if seq_lens is None:
+                        seq_lens = getattr(attn_metadata, "seq_lens", None)
+                    cursor = 0
+                    for row in range(num_contexts):
+                        if seq_lens is not None:
+                            length = int(seq_lens[row].item())
+                        else:
+                            # Fall back to the single-request shortcut.
+                            length = int(getattr(attn_metadata, "num_ctx_tokens", flat.numel()))
+                        prompt_tokens = flat[cursor : cursor + length].detach().cpu().tolist()
+                        cursor += length
+                        try:
+                            self._rdma_v2_offload_layer.push_prompt(
+                                int(request_ids[row]),
+                                prompt_tokens,
+                            )
+                        except RuntimeError as exc:
+                            logger.warning(
+                                "draft_offload push_prompt failed for request %s: %s",
+                                request_ids[row],
+                                exc,
+                            )
+
             return self._rdma_v2_offload_layer(
                 input_ids=accepted_tokens,
                 position_ids=per_request_positions,

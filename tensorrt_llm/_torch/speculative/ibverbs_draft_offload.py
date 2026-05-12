@@ -71,6 +71,19 @@ class IbverbsDraftOffloadConfig:
     sgid_index: int = 0
     pkey_index: int = 0
     ib_port: int = 1
+    # Transport selection. Default is ``ibverbs``; ``tcp`` selects the
+    # pure-TCP endpoint (used for the spec-decode-over-RDMA progression's
+    # phase 1 baseline). When ``tcp`` is used, ``nic_name`` / ``sgid_*``
+    # / ``ib_port`` are ignored, and the endpoint connects to
+    # ``server_host:server_port`` (or binds, if ``is_server`` is set).
+    transport: str = "ibverbs"
+    # When ``transport == "tcp"``, the target sends a ``TcpModelInit`` to
+    # the draft server before the first RDMA round so the draft can lazy-
+    # load this exact model. ``None`` skips the lazy init (draft is
+    # expected to already have the model loaded out-of-band).
+    draft_model_path: Optional[str] = None
+    draft_model_dtype: str = "bfloat16"
+    draft_kv_cache_free_fraction: float = 0.4
 
 
 def _env_int(name, default):
@@ -145,35 +158,52 @@ class IbverbsDraftOffloadLayer(_NN_MODULE_BASE):
             config.max_draft_len,
         )
         from .draft_api_protocol import DraftApiProtocol
-        from .ibverbs_endpoint import IbverbsEndpointConfig, _IbverbsRdmaBackend
         from .spec_decode_channel import SpecDecodeChannel
 
         self.config = config
         self._protocol = DraftApiProtocol
         self._channel_cls = SpecDecodeChannel
 
-        endpoint_cfg = IbverbsEndpointConfig(
-            nic_name=config.nic_name,
-            remote_host=config.server_host,
-            remote_port=config.server_port,
-            remote_peer_name=config.remote_peer_name,
-            recv_queue_depth=config.max_num_requests,
-            payload_bytes=DraftApiProtocol.kMessageBytes,
-            max_num_requests=config.max_num_requests,
-            sgid_index=config.sgid_index,
-            pkey_index=config.pkey_index,
-            ib_port=config.ib_port,
-            is_server=config.is_server,
-            local_port=config.local_port,
-            use_torch_ops=False,
-            torch_ops_lib_path=None,
-        )
-
         if endpoint is not None:
             self._endpoint = endpoint
+        elif config.transport == "tcp":
+            from .tcp_endpoint import TcpEndpointConfig, _TcpRdmaBackend
+
+            tcp_cfg = TcpEndpointConfig(
+                is_server=config.is_server,
+                remote_host=config.server_host,
+                remote_port=config.server_port,
+                bind_host="0.0.0.0",
+                bind_port=config.local_port or config.server_port,
+                recv_queue_depth=config.max_num_requests,
+                payload_bytes=DraftApiProtocol.kMessageBytes,
+            )
+            self._endpoint = _TcpRdmaBackend(tcp_cfg)
         else:
+            from .ibverbs_endpoint import IbverbsEndpointConfig, _IbverbsRdmaBackend
+
+            endpoint_cfg = IbverbsEndpointConfig(
+                nic_name=config.nic_name,
+                remote_host=config.server_host,
+                remote_port=config.server_port,
+                remote_peer_name=config.remote_peer_name,
+                recv_queue_depth=config.max_num_requests,
+                payload_bytes=DraftApiProtocol.kMessageBytes,
+                max_num_requests=config.max_num_requests,
+                sgid_index=config.sgid_index,
+                pkey_index=config.pkey_index,
+                ib_port=config.ib_port,
+                is_server=config.is_server,
+                local_port=config.local_port,
+                use_torch_ops=False,
+                torch_ops_lib_path=None,
+            )
             self._endpoint = _IbverbsRdmaBackend(endpoint_cfg)
-        _debug_trace("__init__ endpoint ready type=%s", type(self._endpoint).__name__)
+        _debug_trace(
+            "__init__ endpoint ready type=%s transport=%s",
+            type(self._endpoint).__name__,
+            config.transport,
+        )
 
         validation_options = DraftApiProtocol.ValidationOptions(
             max_position=config.protocol_max_position,
@@ -209,6 +239,12 @@ class IbverbsDraftOffloadLayer(_NN_MODULE_BASE):
     def _ensure_started(self):
         if self._started:
             return
+        # Order matters when transport=tcp: tell the draft server which
+        # model to load FIRST (slow — minutes for an 8B model), then open
+        # the data-plane socket. Otherwise data-plane connect() races a
+        # not-yet-ready draft.
+        if self.config.transport == "tcp" and self.config.draft_model_path:
+            self._push_tcp_model_init()
         status = self._channel.start()
         if status != self._channel_cls.Status.kOk:
             raise RuntimeError(
@@ -312,8 +348,59 @@ class IbverbsDraftOffloadLayer(_NN_MODULE_BASE):
             self._retired_requests.discard(r)
 
     # ------------------------------------------------------------------
-    # Phase 7: TCP prompt-init control channel
+    # TCP control plane
     # ------------------------------------------------------------------
+
+    def _push_tcp_model_init(self):
+        """Send ``TcpModelInit`` so the draft server lazy-loads its model.
+
+        Only used by the TCP transport. Runs once during ``_ensure_started``
+        before ``prime_recv``, so by the time the first 96-byte frame goes
+        out the draft side already has the model warm.
+        """
+        if not self.config.draft_model_path:
+            return
+        import json as _json
+        import socket as _socket
+
+        msg = {
+            "msg_type": "model_init",
+            "model_path": str(self.config.draft_model_path),
+            "dtype": str(self.config.draft_model_dtype),
+            "max_draft_len": int(self.config.max_draft_len),
+            "kv_cache_free_fraction": float(self.config.draft_kv_cache_free_fraction),
+            "extra_kwargs_json": "",
+        }
+        port = int(self._tcp_prompt_port if self._tcp_prompt_port > 0 else self.config.server_port)
+        sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        # Loading a model on the draft side can take 60s+ (8B model + KV
+        # cache warmup), so the ack timeout is intentionally generous.
+        sock.settimeout(180.0)
+        try:
+            sock.connect((self._tcp_prompt_host, port))
+            sock.sendall((_json.dumps(msg) + "\n").encode("utf-8"))
+            chunks = []
+            while True:
+                ch = sock.recv(4096)
+                if not ch:
+                    raise RuntimeError("draft server closed during model-init ack")
+                chunks.append(ch)
+                if b"\n" in ch:
+                    break
+            line = b"".join(chunks).split(b"\n", 1)[0]
+            ack = _json.loads(line.decode("utf-8"))
+        finally:
+            sock.close()
+        if ack.get("status") != "ok":
+            raise RuntimeError(
+                "TcpModelInit failed: " + str(ack.get("error", "<no error message>"))
+            )
+        _debug_trace(
+            "TcpModelInit ack model=%s vocab=%s eos=%s",
+            self.config.draft_model_path,
+            ack.get("vocab_size"),
+            ack.get("eos_token_id"),
+        )
 
     def push_prompt(self, request_id, prompt_tokens):
         """Send a ``TcpPromptInit`` over TCP to the draft server.

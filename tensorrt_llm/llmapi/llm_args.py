@@ -1504,6 +1504,23 @@ class DraftTargetDecodingConfig(DecodingBaseConfig):
     draft_offload_v2: bool = False
     draft_offload_v2_max_num_requests: int = 256
     draft_offload_v2_remote_peer_name: str = "draft_lpu"
+    # Transport for the v2 path. ``ibverbs`` (default) keeps the existing
+    # WRITE_WITH_IMM path. ``tcp`` selects the pure-TCP transport — used
+    # for the spec-decode-over-RDMA progression phase 1 baseline (no RDMA
+    # hardware required) and as a correctness reference when the draft
+    # backend is being brought up.
+    draft_offload_v2_transport: Literal["ibverbs", "tcp"] = "ibverbs"
+    # When set, the target tells the draft server to lazy-load this model
+    # path (via TcpModelInit) so a single bare draft server process can
+    # serve different draft models depending on which target connects.
+    # If unset, the draft server is expected to have its model loaded
+    # out-of-band before the target connects.
+    draft_offload_v2_model_path: Optional[str] = None
+    draft_offload_v2_model_dtype: str = "bfloat16"
+    draft_offload_v2_kv_cache_free_fraction: float = 0.4
+    # TCP port for the prompt-init / model-init control channel. ``0``
+    # disables; the v2 transport will refuse to push prompts.
+    draft_offload_v2_tcp_prompt_port: int = 0
 
     @model_validator(mode="after")
     def validate_draft_target_config(self):
