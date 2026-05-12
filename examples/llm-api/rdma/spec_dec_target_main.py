@@ -46,6 +46,17 @@ def main() -> int:
     )
     ap.add_argument("--max-tokens", type=int, default=64)
     ap.add_argument("--max-draft-len", type=int, default=4)
+    ap.add_argument(
+        "--transport",
+        choices=["tcp", "ibverbs"],
+        default="tcp",
+        help="Draft offload transport: 'tcp' (phase 1) or 'ibverbs' (phase 2).",
+    )
+    ap.add_argument(
+        "--nic",
+        default="mlx5_0",
+        help="NIC device for --transport ibverbs.",
+    )
     ap.add_argument("--prompt", default="Explain GPUDirect RDMA in one short sentence.")
     ap.add_argument(
         "--baseline",
@@ -83,7 +94,7 @@ def main() -> int:
             cuda_graph_config=None,
         )
     else:
-        spec = DraftTargetDecodingConfig(
+        spec_kwargs = dict(
             max_draft_len=args.max_draft_len,
             speculative_model=args.draft_model,
             draft_offload_enabled=True,
@@ -91,11 +102,19 @@ def main() -> int:
             draft_offload_server_host=args.draft_host,
             draft_offload_server_port=args.draft_port,
             draft_offload_v2_max_num_requests=args.max_num_requests,
-            draft_offload_v2_transport="tcp",
-            draft_offload_v2_model_path=args.draft_model,
+            draft_offload_v2_transport=args.transport,
             draft_offload_v2_kv_cache_free_fraction=args.kv_cache_free_fraction,
             draft_offload_v2_tcp_prompt_port=args.draft_control_port,
         )
+        if args.transport == "tcp":
+            # TCP path lazily loads the draft model via TcpModelInit; pass
+            # the path through.
+            spec_kwargs["draft_offload_v2_model_path"] = args.draft_model
+        else:
+            # ibverbs path: draft_rdma_server_v2.py was started with
+            # --model so the draft is already loaded out-of-band.
+            spec_kwargs["draft_offload_nic_name"] = args.nic
+        spec = DraftTargetDecodingConfig(**spec_kwargs)
         llm = LLM(
             model=args.target_model,
             speculative_config=spec,

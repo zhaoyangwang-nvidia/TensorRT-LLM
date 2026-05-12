@@ -149,16 +149,12 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
                         transport=str(
                             getattr(spec_config, "draft_offload_v2_transport", "ibverbs")
                         ),
-                        draft_model_path=getattr(
-                            spec_config, "draft_offload_v2_model_path", None
-                        ),
+                        draft_model_path=getattr(spec_config, "draft_offload_v2_model_path", None),
                         draft_model_dtype=str(
                             getattr(spec_config, "draft_offload_v2_model_dtype", "bfloat16")
                         ),
                         draft_kv_cache_free_fraction=float(
-                            getattr(
-                                spec_config, "draft_offload_v2_kv_cache_free_fraction", 0.4
-                            )
+                            getattr(spec_config, "draft_offload_v2_kv_cache_free_fraction", 0.4)
                         ),
                         tcp_prompt_port=int(
                             getattr(spec_config, "draft_offload_v2_tcp_prompt_port", 0)
