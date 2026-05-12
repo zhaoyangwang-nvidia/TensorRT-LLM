@@ -456,3 +456,152 @@ host 文件系统 OK）。
 5. 然后恢复 `_run_batch1_graph_fast_path`，把 RDMA round-trip 录进 CUDA graph
 
 软件层全部都准备好了，等的就是 OFED 25.10。
+
+---
+
+## 增补 2：CPU_PROXY 实际 e2e 走通（2026-05-12，DOCA 3.3 + OFED 25.07）
+
+之前 retry-1 的结论是「path 1 在这台机器只能 export QP，不能真发包」。
+后来回来再细抠，发现这个结论 **错** —— path 1 其实能走通，但 izzy
+默认的 CPU_PROXY 路径里 DBR alloc 和 host post_recv 这两块没接好，所以
+表面看像没发包。
+
+### 关键 patch（合到 host 源 `doca_rdma_izzy_work/`）
+
+1. **DBR 用 `calloc()` 而不是 `doca_gpu_mem_alloc(GPU)`**：
+   匹配 SDK sample `verbs_high_level.c:375` 的 CPU_PROXY 分支。CPU_PROXY
+   模式下 GPU 不写 DBR，CPU progress thread 才写，所以 DBR 必须是
+   CPU-accessible 的 host memory。原本 izzy 默认走 GPU memory，CPU 写
+   不进去，doorbell 也就没法触发 NIC。
+
+2. **加 `cpu_proxy_progress` / `cpu_proxy_enabled` / `poll_send_cq_cpu` 三个方法**
+   —— izzy 原本只有 GPU-side 的 progress，没法在 CPU 线程里 poll。
+   `poll_send_cq_cpu` 走 `cudaMemcpy(CQ buf → host)` 再解 mlx5_cqe64，
+   关键路径是当 op_own 高 4 位是 13（REQ_ERR）/ 14（RESP_ERR）时，
+   额外 dump `mlx5_err_cqe` 里的 byte 54 = vendor_err_synd、byte 55 =
+   syndrome、byte 56-59 = s_wqe_opcode_qpn —— 这一段是定位 IB 错误最
+   关键的诊断信号。
+
+3. **kernel 加 plain RDMA_WRITE 分支**（`imm_value==0` 时用 opcode 0x08
+   而不是 0x09）：用来绕过 WRITE_WITH_IMM 在 responder 需要 posted
+   recv WR 的协议约束。
+
+### 关键发现
+
+在 client 上做 CPU_PROXY mode 的 `RDMA_WRITE`（无 IMM），96 字节
+pattern `0xa0..0xff` 写到 server 的 recv buffer：
+
+```
+[server] recv buf first 32: [160, 161, 162, ..., 191]   # 0xa0..0xbf
+[server] match expected pattern (0xa0..): True
+```
+
+**数据真的通过 RDMA 落到了远端 recv buffer**。这是 phase10 整个项目
+里第一次拿到的 e2e 成功信号。
+
+完整链路验证（每一步都有 stderr 诊断印出来）：
+
+1. GPU kernel 写 WQE 到外部 umem
+2. GPU 写 `*sq_db`（producer counter，host memory 里）
+3. CPU progress thread detect transition (`*sq_db: 0 → 1`)
+4. CPU 写 DBR（BE-encoded prod=1，即 `0x01000000`）
+5. CPU 写 UAR doorbell（构造 `[qpn_ds | wqe_idx]` 64-bit，写到
+   `qp_cpu[0x18]` 指向的 UAR 地址）
+6. NIC fetch WQE
+7. NIC 发 RDMA WRITE 包
+8. NIC（loopback）把数据 DMA 进 server 的 recv buffer
+9. CPU 在 server 端读出来对得上
+
+### WRITE_WITH_IMM 卡在 responder
+
+用 `IMM_VALUE=0xdeadbeef` 跑 WRITE_WITH_IMM 时，client send CQ 收到
+error CQE：
+
+```
+[send_cq cqe0 ERR] syndrome=0x16 vendor=0x87 s_wqe_op_qpn=0x09000068
+```
+
+`syndrome=0x16` 是 **RNR_RETRY_EXC_ERR**（接收端没准备好，retry 次数
+耗尽）。说明 client 端的 doorbell + 包发送是 OK 的，问题在 responder
+没 posted recv WR。
+
+试了几条 post_recv 路径都不通：
+
+- `doca_verbs_bridge_post_recv` —— 在外部 datapath QP 上 crash
+- `torch.ops.doca_rdma.post_recv_wrs` GPU SM DB 内核 —— 在 CPU_PROXY
+  UAR 上 illegal memory access（CPU_PROXY 的 UAR 不是 GPU 可写的）
+
+留给后续：写 CPU 端手动构造 mlx5 RQ WQE + RQ DBR 写入的路径，或者
+让 responder 不走 CPU_PROXY（responder 可以用默认 GPU 路径，requester
+跟 responder 不需要同一种 NIC handler）。
+
+### 影响
+
+- **path 1 实际是可用的** —— 不需要等 OFED 25.10
+- TRT-LLM offloading 的核心一边（GPU 主动发 RDMA WRITE）路径打通
+- 反向（GPU 主动收 WRITE_WITH_IMM 或 SEND）还需要 recv WR posting 的方案
+
+### 工作目录
+
+izzy 源 + patch 一并落进了 TRT-LLM 仓 `examples/llm-api/rdma/`：
+
+| 文件 | 用途 |
+|---|---|
+| `izzy_patches/01-cpu-proxy-mode.patch` | 唯一的 izzy 源 patch（针对 `pearl-izzy` 分支） |
+| `build_doca_extension.sh` | 自动 apply patch + cmake + make |
+| `doca_server_cpu_proxy.py` / `doca_client_cpu_proxy.py` | 单包 smoke 脚本 |
+| `README_cpu_proxy.md` | 跑法 / pass 标准 |
+
+容器内 izzy 源仍在 `/opt/doca_rdma_izzy/` （bind-mount 一个写得了的副本进去）。
+
+### 跨 GPU / 跨 NIC 复测
+
+为了排除"loopback 假象"，又在同一台机的 GPU 0 + mlx5_0 vs GPU 1 +
+mlx5_1 之间跑一遍（不是同一个 GPU 同一个 NIC）：
+
+```
+[server] connected, cpu_proxy_enabled=1   # GPU 0 / mlx5_0
+[server] sleeping 5s for inbound write...
+[server] recv buf first 32: [160, 161, ..., 191]   # 0xa0..0xbf
+[server] match expected pattern (0xa0..): True
+```
+
+QP 信息 (`local_qpn=121 -> remote_qpn=358`, `remote_rkey=0x23afb0`)
+确认是两端不同的 QP / mkey，跨 NIC 真发包真接收。
+
+### 复现
+
+```bash
+cd /path/to/TensorRT-LLM/examples/llm-api/rdma
+./build_doca_extension.sh /opt/doca_rdma_izzy
+
+# Server: GPU 0 / mlx5_0
+docker exec -d \
+  -e GLUE_RDMA_ALLOW_PROXY_HANDLERS=1 -e GLUE_RDMA_NIC_HANDLERS=1 \
+  -e GPU_ID=0 -e NIC=mlx5_0 -e PORT=47780 \
+  -e PYTHONPATH=/opt/doca_rdma_izzy/build \
+  rdma_doca python3 -u /opt/doca_rdma_izzy/build/doca_server_cpu_proxy.py
+
+# Client: GPU 1 / mlx5_1 → plain RDMA_WRITE
+docker exec \
+  -e GLUE_RDMA_ALLOW_PROXY_HANDLERS=1 -e GLUE_RDMA_NIC_HANDLERS=1 \
+  -e IMM_VALUE=0 \
+  -e GPU_ID=1 -e NIC=mlx5_1 -e PORT=47780 -e HOST=127.0.0.1 \
+  -e PYTHONPATH=/opt/doca_rdma_izzy/build \
+  rdma_doca python3 -u /opt/doca_rdma_izzy/build/doca_client_cpu_proxy.py
+```
+
+### 投机解码端到端为什么还没跑
+
+`draft_rdma_server_v2.py`（Phase 5/6 实现的 spec-dec 服务）目前的
+transport 是 **ibverbs WRITE_WITH_IMM**，target/draft 双向都要靠 IMM
+信号通知对端"请求来了 / 响应好了"，本质上是 SEND/RECV 语义。
+
+把它切到 DOCA CPU_PROXY 需要两端都能 post recv WR；而本次发现的
+`doca_verbs_bridge_post_recv` 在 external-datapath QP 上 crash、izzy
+自带的 `post_recv_wrs` GPU 内核在 CPU_PROXY 的 UAR 上 illegal memory。
+两条路都通不到，所以 spec-dec e2e 还没真跑通——这一步留到 task
+follow-up（recv-WR posting for CPU_PROXY responder）解了之后做。
+
+当前 land 的成果限定在「**单向 GPU 主动发 RDMA WRITE + CPU_PROXY
+doorbell**」这一段链路，不假装把投机解码全打通。

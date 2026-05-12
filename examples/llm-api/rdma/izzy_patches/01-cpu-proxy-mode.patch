@@ -1,0 +1,365 @@
+# DOCA CPU_PROXY support on top of izzy doca_rdma (pearl-izzy branch)
+#
+# Apply with:
+#     cd /opt/doca_rdma_izzy && patch -p1 < .../01-cpu-proxy-mode.patch
+#
+# Summary
+# - DBR backing memory: switch to plain calloc() when the user opts into
+#   CPU_PROXY (env GLUE_RDMA_NIC_HANDLERS=1 + GLUE_RDMA_ALLOW_PROXY_HANDLERS=1),
+#   matching DOCA sample verbs_high_level.c:375. CPU progress thread must
+#   read/write the DBR record, so it cannot live in GPU memory.
+# - New methods on DocaRdmaEndpoint:
+#       cpu_proxy_enabled / cpu_proxy_progress / poll_send_cq_cpu
+#   exposed through pybind. poll_send_cq_cpu decodes mlx5_err_cqe so test
+#   harnesses can attribute REQ_ERR/RESP_ERR completions to a syndrome.
+# - Kernel rdma_write_imm_kernel: when imm_value == 0, emit opcode 0x08
+#   (RDMA_WRITE) instead of 0x09 (RDMA_WRITE_IMM). Lets us validate the
+#   doorbell path without the responder needing a posted recv WR.
+# - Replace post_recv stub with doca_verbs_bridge_post_recv (still broken
+#   for external-datapath QPs; see follow-up task tracking).
+# - Build fixes already in phase10 doc but consolidated here for one-shot
+#   apply: ::listen namespace qualifier; CMakeLists pybind LTO off.
+
+--- a/doca_rdma/CMakeLists.txt
++++ b/doca_rdma/CMakeLists.txt
+@@ -39,6 +39,11 @@
+ 
+ # pybind11
+ find_package(pybind11 REQUIRED)
++# Pybind11 forces IPO/LTO which strips CUDA fatbin symbols when linking the
++# static kernels archive into the module. Disable LTO to keep them.
++set(CMAKE_INTERPROCEDURAL_OPTIMIZATION OFF)
++set(PYBIND11_LTO_CXX_FLAGS "")
++set(PYBIND11_LTO_LINKER_FLAGS "")
+ 
+ # Ensure extensions compile with the exact C++ ABI/flags expected by the
+ # active PyTorch build (for example, _GLIBCXX_USE_CXX11_ABI).
+--- a/doca_rdma/include/doca_rdma_endpoint.h
++++ b/doca_rdma/include/doca_rdma_endpoint.h
+@@ -112,6 +112,13 @@
+     bool rdma_write_with_imm(std::string const& peer_name, void* local_buf, size_t length, uint32_t imm_value);
+     bool poll_for_completion(std::string const& peer_name, uint32_t* imm_value);
+ 
++    // CPU_PROXY mode: enabled-flag query + progress tick (call from a CPU thread)
++    int cpu_proxy_enabled(std::string const& peer_name);
++    int cpu_proxy_progress(std::string const& peer_name);
++    // Poll the send CQ from the CPU side; returns # completions found, -1 on error.
++    // Writes back up to max_out completion words: bits [63:32]=opcode, [31:0]=syndrome|wqe_idx.
++    int poll_send_cq_cpu(std::string const& peer_name, uint64_t* out, int max_out);
++
+     // Accessors
+     std::string const& get_local_name() const
+     {
+--- a/doca_rdma/src/doca_rdma_endpoint.cpp
++++ b/doca_rdma/src/doca_rdma_endpoint.cpp
+@@ -21,6 +21,7 @@
+ #include <sstream>
+ #include <stdexcept>
+ #include <sys/socket.h>
++#include <vector>
+ #include <unistd.h>
+ 
+ #include <cuda.h>
+@@ -265,6 +266,8 @@
+     void* umem_gpu_ptr = nullptr;
+     doca_umem* umem = nullptr;
+     void* dbr_gpu_ptr = nullptr;
++    void* dbr_host_alloc = nullptr;  // CPU_PROXY path: backing calloc'd memory to free
++    bool dbr_is_host = false;
+     doca_umem* dbr_umem = nullptr;
+     doca_uar* uar = nullptr;
+     doca_gpu_verbs_qp* gpu_qp = nullptr;
+@@ -820,24 +823,60 @@
+         return nullptr;
+     }
+ 
+-    // Allocate GPU memory for doorbell record
++    // Allocate doorbell record memory. For CPU_PROXY mode, DBR must be HOST
++    // memory so the CPU progress thread can write it (matches DOCA sample
++    // verbs_high_level.c CPU_PROXY branch using calloc()).
+     uint32_t dbr_size = align_up(DBR_SIZE, get_page_size());
+-    result = doca_gpu_mem_alloc(
+-        doca_state_->gpu, dbr_size, get_page_size(), DOCA_GPU_MEM_TYPE_GPU, &qp->dbr_gpu_ptr, nullptr);
+-    if (result != DOCA_SUCCESS)
++    bool use_host_dbr = false;
+     {
+-        doca_umem_destroy(qp->umem);
+-        doca_gpu_mem_free(doca_state_->gpu, qp->umem_gpu_ptr);
+-        doca_uar_destroy(qp->uar);
+-        doca_verbs_qp_init_attr_destroy(qp_attr);
+-        DOCA_LOG_ERR("Failed to alloc GPU memory for DBR: %s", doca_error_get_descr(result));
+-        return nullptr;
++        const char* hh = std::getenv("GLUE_RDMA_NIC_HANDLERS");
++        const char* allow = std::getenv("GLUE_RDMA_ALLOW_PROXY_HANDLERS");
++        bool allow_proxy = (allow && (allow[0] == '1' || allow[0] == 'y' || allow[0] == 'Y'));
++        if (allow_proxy && hh)
++        {
++            std::string s(hh);
++            if (s.find('0') != std::string::npos || s.find('1') != std::string::npos)
++                use_host_dbr = true;
++        }
++    }
++    qp->dbr_is_host = use_host_dbr;
++    if (use_host_dbr)
++    {
++        void* host_ptr = std::calloc(dbr_size, 1);
++        if (host_ptr == nullptr)
++        {
++            doca_umem_destroy(qp->umem);
++            doca_gpu_mem_free(doca_state_->gpu, qp->umem_gpu_ptr);
++            doca_uar_destroy(qp->uar);
++            doca_verbs_qp_init_attr_destroy(qp_attr);
++            DOCA_LOG_ERR("Failed to calloc CPU memory for DBR");
++            return nullptr;
++        }
++        qp->dbr_host_alloc = host_ptr;
++        qp->dbr_gpu_ptr = nullptr;  // important: keeps later gpu_mem_free(NULL) a no-op
++        result = doca_umem_create(doca_state_->ddev, host_ptr, dbr_size,
++            DOCA_ACCESS_FLAG_LOCAL_READ_WRITE | DOCA_ACCESS_FLAG_RDMA_WRITE | DOCA_ACCESS_FLAG_RDMA_READ
++                | DOCA_ACCESS_FLAG_RDMA_ATOMIC,
++            &qp->dbr_umem);
++    }
++    else
++    {
++        result = doca_gpu_mem_alloc(
++            doca_state_->gpu, dbr_size, get_page_size(), DOCA_GPU_MEM_TYPE_GPU, &qp->dbr_gpu_ptr, nullptr);
++        if (result != DOCA_SUCCESS)
++        {
++            doca_umem_destroy(qp->umem);
++            doca_gpu_mem_free(doca_state_->gpu, qp->umem_gpu_ptr);
++            doca_uar_destroy(qp->uar);
++            doca_verbs_qp_init_attr_destroy(qp_attr);
++            DOCA_LOG_ERR("Failed to alloc GPU memory for DBR: %s", doca_error_get_descr(result));
++            return nullptr;
++        }
++        result = doca_umem_gpu_create(doca_state_->gpu, doca_state_->ddev, qp->dbr_gpu_ptr, dbr_size,
++            DOCA_ACCESS_FLAG_LOCAL_READ_WRITE | DOCA_ACCESS_FLAG_RDMA_WRITE | DOCA_ACCESS_FLAG_RDMA_READ
++                | DOCA_ACCESS_FLAG_RDMA_ATOMIC,
++            &qp->dbr_umem);
+     }
+-
+-    result = doca_umem_gpu_create(doca_state_->gpu, doca_state_->ddev, qp->dbr_gpu_ptr, dbr_size,
+-        DOCA_ACCESS_FLAG_LOCAL_READ_WRITE | DOCA_ACCESS_FLAG_RDMA_WRITE | DOCA_ACCESS_FLAG_RDMA_READ
+-            | DOCA_ACCESS_FLAG_RDMA_ATOMIC,
+-        &qp->dbr_umem);
+     if (result != DOCA_SUCCESS)
+     {
+         doca_gpu_mem_free(doca_state_->gpu, qp->dbr_gpu_ptr);
+@@ -1321,7 +1360,7 @@
+         return false;
+     }
+ 
+-    if (listen(listen_sock, 1) < 0)
++    if (::listen(listen_sock, 1) < 0)
+     {
+         DOCA_LOG_ERR("Failed to listen on port %d", port);
+         close(listen_sock);
+@@ -1620,13 +1659,28 @@
+ 
+ bool DocaRdmaEndpoint::post_recv(std::string const& peer_name, void* buf, size_t length, uint32_t lkey)
+ {
+-    // For GPU-initiated RDMA, receives are posted from the GPU side using
+-    // doca_gpu_dev_verbs_submit with DOCA_GPUNETIO_VERBS_QP_RQ
+-    // This host-side function is a placeholder
+-    (void) peer_name;
+-    (void) buf;
+-    (void) length;
+-    (void) lkey;
++    int idx = find_peer_index(peer_name);
++    if (idx < 0 || idx >= (int) doca_state_->peer_qps.size())
++        return false;
++    auto& qp_state = doca_state_->peer_qps[idx];
++    if (!qp_state->qp)
++        return false;
++    struct ibv_sge sge{};
++    sge.addr = reinterpret_cast<uintptr_t>(buf);
++    sge.length = (uint32_t) length;
++    sge.lkey = lkey;
++    struct ibv_recv_wr wr{};
++    wr.wr_id = 0;
++    wr.next = nullptr;
++    wr.sg_list = &sge;
++    wr.num_sge = 1;
++    struct ibv_recv_wr* bad = nullptr;
++    int rc = doca_verbs_bridge_post_recv(qp_state->qp, &wr, &bad);
++    if (rc != 0)
++    {
++        DOCA_LOG_ERR("doca_verbs_bridge_post_recv failed: rc=%d", rc);
++        return false;
++    }
+     return true;
+ }
+ 
+@@ -1693,3 +1747,119 @@
+ {
+     return accept_peer(port, "rdma_peer");
+ }
++
++int DocaRdmaEndpoint::cpu_proxy_enabled(std::string const& peer_name)
++{
++    int idx = find_peer_index(peer_name);
++    if (idx < 0 || idx >= (int) doca_state_->peer_qps.size())
++        return -1;
++    auto& qp_state = doca_state_->peer_qps[idx];
++    if (qp_state->gpu_qp == nullptr)
++        return -2;
++    uint8_t enabled = 0;
++    doca_error_t r = doca_gpu_verbs_cpu_proxy_enabled(qp_state->gpu_qp, &enabled);
++    if (r != DOCA_SUCCESS)
++        return -10 - (int) r;
++    return (int) enabled;
++}
++
++int DocaRdmaEndpoint::cpu_proxy_progress(std::string const& peer_name)
++{
++    int idx = find_peer_index(peer_name);
++    if (idx < 0 || idx >= (int) doca_state_->peer_qps.size())
++        return -1;
++    auto& qp_state = doca_state_->peer_qps[idx];
++    if (qp_state->gpu_qp == nullptr)
++        return -2;
++
++    // Diagnostic: when *qp_cpu[0] (producer counter) transitions to non-zero,
++    // dump the relevant qp_cpu fields. The opaque layout we reverse-engineered
++    // from the SDK is documented in phase 10 notes; the offsets are stable
++    // across DOCA 3.3 builds we have seen.
++    static thread_local uint64_t dbg_last_v0 = (uint64_t) -1;
++    static thread_local int dbg_events = 0;
++    unsigned char* p = reinterpret_cast<unsigned char*>(qp_state->gpu_qp);
++    uint64_t v0_before = 0;
++    if (p)
++    {
++        void* p0 = *reinterpret_cast<void**>(p + 0);
++        v0_before = p0 ? *reinterpret_cast<volatile uint64_t*>(p0) : 0;
++        if (v0_before != dbg_last_v0 && dbg_events < 5)
++        {
++            uint32_t qpn_ds = *reinterpret_cast<uint32_t*>(p + 0x2c);
++            unsigned char b30 = *(p + 0x30);
++            void* dbr_addr = *reinterpret_cast<void**>(p + 0x20);
++            uint32_t dbr_val = dbr_addr ? *reinterpret_cast<volatile uint32_t*>(dbr_addr) : 0;
++            void* uar_addr = *reinterpret_cast<void**>(p + 0x18);
++            std::fprintf(stderr,
++                "[progress transition] prod=%lu qpn_ds@0x2c=0x%08x [0x30]=%u UAR=%p DBR=%p (*DBR=0x%08x)\n",
++                (unsigned long) v0_before, qpn_ds, (unsigned) b30, uar_addr, dbr_addr, dbr_val);
++            dbg_last_v0 = v0_before;
++            dbg_events++;
++        }
++    }
++    doca_error_t r = doca_gpu_verbs_cpu_proxy_progress(qp_state->gpu_qp);
++    if (p && v0_before != 0 && dbg_events < 10)
++    {
++        void* dbr_addr = *reinterpret_cast<void**>(p + 0x20);
++        uint32_t dbr_val = dbr_addr ? *reinterpret_cast<volatile uint32_t*>(dbr_addr) : 0;
++        std::fprintf(stderr, "[progress post] r=%d *DBR=0x%08x last_seen=%lu\n", (int) r, dbr_val,
++            (unsigned long) *reinterpret_cast<uint64_t*>(p + 0x10));
++        dbg_events++;
++    }
++    return (int) r;
++}
++
++int DocaRdmaEndpoint::poll_send_cq_cpu(std::string const& peer_name, uint64_t* out, int max_out)
++{
++    int idx = find_peer_index(peer_name);
++    if (idx < 0 || idx >= (int) doca_state_->peer_qps.size())
++        return -1;
++    auto& qp_state = doca_state_->peer_qps[idx];
++    if (!qp_state->send_cq || !qp_state->send_cq->umem_gpu_ptr)
++        return -2;
++
++    // CQ memory lives on GPU; copy to host buffer and walk CQEs.
++    uint32_t ncqe = qp_state->send_cq->size;
++    if (ncqe == 0) return 0;
++    size_t bytes = (size_t) ncqe * sizeof(struct mlx5_cqe64);
++    std::vector<uint8_t> host_buf(bytes);
++    cudaError_t cerr = cudaMemcpy(host_buf.data(), qp_state->send_cq->umem_gpu_ptr, bytes, cudaMemcpyDefault);
++    if (cerr != cudaSuccess)
++        return -3;
++    auto* cqes = reinterpret_cast<struct mlx5_cqe64*>(host_buf.data());
++    int n = 0;
++    for (uint32_t i = 0; i < ncqe && n < max_out; ++i)
++    {
++        uint8_t op_own = cqes[i].op_own;
++        uint8_t opcode = (op_own & 0xF0) >> 4;
++        uint8_t owner = op_own & 0x1;
++        // Anything that's not the initial (invalid / hw-owner) byte 0x00 nor 0xFF tells us NIC touched it.
++        // Pack opcode | owner | byte_cnt for upstream interpretation.
++        if (op_own != 0x00 && op_own != 0xF0 && op_own != 0xFF)
++        {
++            uint32_t byte_cnt = __builtin_bswap32(cqes[i].byte_cnt);
++            uint32_t wqe_ctr = __builtin_bswap16(cqes[i].wqe_counter);
++            uint64_t pack = ((uint64_t) opcode << 56) | ((uint64_t) owner << 48) | ((uint64_t) (wqe_ctr & 0xFFFF) << 32)
++                          | (byte_cnt & 0xFFFFFFFFu);
++            out[n++] = pack;
++            // Pretty-print this CQE; if it's an error CQE (REQ_ERR=13, RESP_ERR=14),
++            // also decode the mlx5_err_cqe fields (syndrome / vendor_err_synd).
++            unsigned char* rb = host_buf.data() + (size_t) i * sizeof(struct mlx5_cqe64);
++            std::fprintf(stderr, "[send_cq cqe%u] op_own=0x%02x opcode=%u owner=%u wqe_counter=%u byte_cnt=%u\n", i,
++                op_own, opcode, owner, wqe_ctr, byte_cnt);
++            if (opcode == 13 /*MLX5_CQE_REQ_ERR*/ || opcode == 14 /*MLX5_CQE_RESP_ERR*/)
++            {
++                // err_cqe: byte 54=vendor_err_synd, byte 55=syndrome, bytes 56..59=s_wqe_opcode_qpn (BE)
++                uint8_t vendor_synd = rb[54];
++                uint8_t syndrome = rb[55];
++                uint32_t wqe_op_qpn_be;
++                std::memcpy(&wqe_op_qpn_be, rb + 56, 4);
++                uint32_t wqe_op_qpn = __builtin_bswap32(wqe_op_qpn_be);
++                std::fprintf(stderr, "[send_cq cqe%u ERR] syndrome=0x%02x vendor=0x%02x s_wqe_op_qpn=0x%08x\n", i,
++                    syndrome, vendor_synd, wqe_op_qpn);
++            }
++        }
++    }
++    return n;
++}
+--- a/doca_rdma/src/doca_rdma_torch_ops.cu
++++ b/doca_rdma/src/doca_rdma_torch_ops.cu
+@@ -21,6 +21,9 @@
+ #ifndef MLX5_OPCODE_RDMA_WRITE_IMM
+ #define MLX5_OPCODE_RDMA_WRITE_IMM 0x09
+ #endif
++#ifndef MLX5_OPCODE_RDMA_WRITE
++#define MLX5_OPCODE_RDMA_WRITE 0x08
++#endif
+ 
+ // Use system mlx5_cqe64 definition
+ #include <infiniband/mlx5dv.h>
+@@ -66,7 +69,9 @@
+     uint64_t wqe_idx = doca_gpu_dev_verbs_reserve_wq_slots(qp, 1);
+     doca_gpu_dev_verbs_wqe* wqe_ptr = doca_gpu_dev_verbs_get_wqe_ptr(qp, wqe_idx);
+ 
+-    doca_gpu_dev_verbs_wqe_prepare_write(qp, wqe_ptr, wqe_idx, MLX5_OPCODE_RDMA_WRITE_IMM,
++    // For diagnostic: when imm_value==0, use plain RDMA_WRITE (no IMM); responder needs no recv WR.
++    uint8_t op = (imm_value == 0) ? MLX5_OPCODE_RDMA_WRITE : MLX5_OPCODE_RDMA_WRITE_IMM;
++    doca_gpu_dev_verbs_wqe_prepare_write(qp, wqe_ptr, wqe_idx, op,
+         DOCA_GPUNETIO_MLX5_WQE_CTRL_CQ_UPDATE, imm_be, remote_addr, rkey_be, (uint64_t) local_buf, lkey_be, size);
+ 
+     doca_gpu_dev_verbs_mark_wqes_ready(qp, wqe_idx, wqe_idx);
+--- a/doca_rdma/src/pybind_module.cpp
++++ b/doca_rdma/src/pybind_module.cpp
+@@ -126,6 +126,27 @@
+             },
+             py::arg("peer_name"), "Poll for completion, returns (completed, imm_value)")
+ 
++        // CPU_PROXY support
++        .def("cpu_proxy_enabled", &DocaRdmaEndpoint::cpu_proxy_enabled, py::arg("peer_name"),
++            "Query whether CPU proxy mode is enabled for this QP")
++        .def("cpu_proxy_progress", &DocaRdmaEndpoint::cpu_proxy_progress, py::arg("peer_name"),
++            "Tick CPU proxy progress (poll producer counter, ring NIC doorbell)")
++        .def(
++            "poll_send_cq_cpu",
++            [](DocaRdmaEndpoint& self, std::string const& peer_name, int max_out)
++            {
++                std::vector<uint64_t> out(max_out > 0 ? max_out : 0);
++                int n = self.poll_send_cq_cpu(peer_name, out.data(), max_out);
++                py::list lst;
++                if (n > 0)
++                {
++                    for (int i = 0; i < n; ++i) lst.append(out[(size_t) i]);
++                }
++                return py::make_tuple(n, lst);
++            },
++            py::arg("peer_name"), py::arg("max_out") = 16,
++            "CPU-side send CQ poll, returns (n, [packed_cqe_words]); negative n on error")
++
+         // Properties
+         .def_property_readonly("local_name", &DocaRdmaEndpoint::get_local_name)
+         .def_property_readonly("is_initialized", &DocaRdmaEndpoint::is_initialized);
