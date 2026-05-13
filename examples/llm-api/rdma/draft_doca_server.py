@@ -63,7 +63,10 @@ class _TrtLlmDraftBackend:
             f"max_draft_len={max_draft_len}",
             flush=True,
         )
+        self.model_path = str(model_path)
+        self.dtype = str(dtype)
         self.max_draft_len = max_draft_len
+        self.kv_cache_free_fraction = float(kv_cache_free_fraction)
         self.llm = LLM(
             model=model_path,
             dtype=dtype,
@@ -86,7 +89,18 @@ class _TrtLlmDraftBackend:
         self.vocab_size = int(self.tokenizer.vocab_size)
         self.eos_token_id = int(self.tokenizer.eos_token_id or 0)
 
+    def matches_model_init(self, msg) -> bool:
+        return (
+            self.model_path == str(msg.model_path)
+            and self.dtype == str(msg.dtype)
+            and int(self.max_draft_len) == int(msg.max_draft_len)
+        )
+
+    def reset_sessions(self):
+        self._sessions.clear()
+
     def init_session(self, request_id, prompt_tokens):
+        self._sessions.pop(int(request_id), None)
         self._sessions[int(request_id)] = list(int(t) for t in prompt_tokens)
         return len(prompt_tokens) - 1
 
@@ -111,7 +125,14 @@ class _MockDraftBackend:
         self.vocab_size = 0
         self.eos_token_id = 0
 
+    def matches_model_init(self, msg) -> bool:
+        return int(self.max_draft_len) == int(msg.max_draft_len)
+
+    def reset_sessions(self):
+        self._sessions.clear()
+
     def init_session(self, request_id, prompt_tokens):
+        self._sessions.pop(int(request_id), None)
         self._sessions[int(request_id)] = len(prompt_tokens)
         return len(prompt_tokens) - 1
 
@@ -190,13 +211,27 @@ class DraftDocaServer:
     def _handle_model_init(self, conn, msg):
         with self._backend_lock:
             if self._backend is not None:
-                ack = dsp.TcpModelInitAck(
-                    status="ok",
-                    vocab_size=int(getattr(self._backend, "vocab_size", 0)),
-                    eos_token_id=int(getattr(self._backend, "eos_token_id", 0)),
+                if self._backend.matches_model_init(msg):
+                    self._backend.reset_sessions()
+                    ack = dsp.TcpModelInitAck(
+                        status="ok",
+                        vocab_size=int(getattr(self._backend, "vocab_size", 0)),
+                        eos_token_id=int(getattr(self._backend, "eos_token_id", 0)),
+                    )
+                    print(
+                        f"[draft][doca-ctrl] model_init reused existing model={msg.model_path}; "
+                        "cleared sessions",
+                        flush=True,
+                    )
+                    conn.sendall(dsp.serialize(ack))
+                    return
+                print(
+                    "[draft][doca-ctrl] model changed; reloading old=%s new=%s"
+                    % (getattr(self._backend, "model_path", "<mock>"), msg.model_path),
+                    flush=True,
                 )
-                conn.sendall(dsp.serialize(ack))
-                return
+                self._backend = None
+                self._backend_ready.clear()
             try:
                 if self._args.backend == "mock":
                     self._backend = _MockDraftBackend(int(msg.max_draft_len))
@@ -232,6 +267,8 @@ class DraftDocaServer:
             )
             return
         try:
+            if hasattr(self._backend, "reset_sessions"):
+                self._backend.reset_sessions()
             last_pos = self._backend.init_session(
                 request_id=int(msg.request_id), prompt_tokens=msg.prompt_tokens
             )

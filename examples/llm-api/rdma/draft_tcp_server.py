@@ -64,7 +64,10 @@ class _TrtLlmDraftBackend:
             f"max_draft_len={max_draft_len}",
             flush=True,
         )
+        self.model_path = str(model_path)
+        self.dtype = str(dtype)
         self.max_draft_len = max_draft_len
+        self.kv_cache_free_fraction = float(kv_cache_free_fraction)
         # ``free_gpu_memory_fraction`` is the share of *remaining* GPU mem
         # the TRT-LLM KV cache may use; 0.4 leaves plenty of headroom on
         # a shared GPU. ``cuda_graph_config=None`` keeps startup short.
@@ -95,8 +98,19 @@ class _TrtLlmDraftBackend:
             flush=True,
         )
 
+    def matches_model_init(self, msg: "dsp.TcpModelInit") -> bool:
+        return (
+            self.model_path == str(msg.model_path)
+            and self.dtype == str(msg.dtype)
+            and int(self.max_draft_len) == int(msg.max_draft_len)
+        )
+
+    def reset_sessions(self):
+        self._sessions.clear()
+
     def init_session(self, request_id: int, prompt_tokens):
         """Called on TcpPromptInit — establish the per-request prefix."""
+        self._sessions.pop(int(request_id), None)
         self._sessions[int(request_id)] = list(int(t) for t in prompt_tokens)
         return len(prompt_tokens) - 1
 
@@ -124,7 +138,14 @@ class _MockDraftBackend:
         self.vocab_size = 0
         self.eos_token_id = 0
 
+    def matches_model_init(self, msg: "dsp.TcpModelInit") -> bool:
+        return int(self.max_draft_len) == int(msg.max_draft_len)
+
+    def reset_sessions(self):
+        self._sessions.clear()
+
     def init_session(self, request_id, prompt_tokens):
+        self._sessions.pop(int(request_id), None)
         self._sessions[int(request_id)] = len(prompt_tokens)
         return len(prompt_tokens) - 1
 
@@ -142,21 +163,25 @@ class DraftTcpServer:
         self._backend_ready = threading.Event()
         self._stop = False
 
-        # Data plane: TcpRdmaBackend in server mode, wrapped in
-        # SpecDecodeChannel for route/imm-data plumbing.
+        # Data-plane endpoints are per target connection.  A long-lived
+        # draft process can serve a second target run by accepting a new
+        # connection after the previous target exits.
+        self._endpoint = None
+        self._channel = None
+        self._control_listener_thread = None
+        self._round_count = 0
+
+    def _new_channel(self):
         tcp_cfg = TcpEndpointConfig(
             is_server=True,
             bind_host="0.0.0.0",
-            bind_port=int(args.port),
-            recv_queue_depth=int(args.max_num_requests),
+            bind_port=int(self._args.port),
+            recv_queue_depth=int(self._args.max_num_requests),
             payload_bytes=DraftApiProtocol.kMessageBytes,
-            handshake_timeout_s=float(args.handshake_timeout_s),
+            handshake_timeout_s=float(self._args.handshake_timeout_s),
         )
-        self._endpoint = _TcpRdmaBackend(tcp_cfg)
-        self._channel = SpecDecodeChannel(self._endpoint)
-
-        self._control_listener_thread = None
-        self._round_count = 0
+        endpoint = _TcpRdmaBackend(tcp_cfg)
+        return endpoint, SpecDecodeChannel(endpoint)
 
     # ------------------------------------------------------------------
     # Control plane (JSON-over-TCP)
@@ -208,14 +233,27 @@ class DraftTcpServer:
     def _handle_model_init(self, conn, msg: "dsp.TcpModelInit"):
         with self._backend_lock:
             if self._backend is not None:
-                # Idempotent — re-acking is OK if target retries.
-                ack = dsp.TcpModelInitAck(
-                    status="ok",
-                    vocab_size=int(getattr(self._backend, "vocab_size", 0)),
-                    eos_token_id=int(getattr(self._backend, "eos_token_id", 0)),
+                if self._backend.matches_model_init(msg):
+                    self._backend.reset_sessions()
+                    ack = dsp.TcpModelInitAck(
+                        status="ok",
+                        vocab_size=int(getattr(self._backend, "vocab_size", 0)),
+                        eos_token_id=int(getattr(self._backend, "eos_token_id", 0)),
+                    )
+                    print(
+                        f"[draft][control] model_init reused existing model={msg.model_path}; "
+                        "cleared sessions",
+                        flush=True,
+                    )
+                    conn.sendall(dsp.serialize(ack))
+                    return
+                print(
+                    "[draft][control] model changed; reloading old=%s new=%s"
+                    % (getattr(self._backend, "model_path", "<mock>"), msg.model_path),
+                    flush=True,
                 )
-                conn.sendall(dsp.serialize(ack))
-                return
+                self._backend = None
+                self._backend_ready.clear()
             try:
                 if self._args.backend == "mock":
                     self._backend = _MockDraftBackend(int(msg.max_draft_len))
@@ -248,6 +286,8 @@ class DraftTcpServer:
             conn.sendall(dsp.serialize(ack))
             return
         try:
+            if hasattr(self._backend, "reset_sessions"):
+                self._backend.reset_sessions()
             last_pos = self._backend.init_session(
                 request_id=int(msg.request_id),
                 prompt_tokens=msg.prompt_tokens,
@@ -290,21 +330,42 @@ class DraftTcpServer:
             flush=True,
         )
 
-        s = self._channel.start()
-        if s != SpecDecodeChannel.Status.kOk:
-            raise RuntimeError("channel.start failed: " + SpecDecodeChannel.to_string(s))
-        s = self._channel.prime_recv(int(self._args.max_num_requests))
-        if s not in (
-            SpecDecodeChannel.Status.kOk,
-            SpecDecodeChannel.Status.kEndpointQueueFull,
-        ):
-            raise RuntimeError("prime_recv failed: " + SpecDecodeChannel.to_string(s))
-        print("[draft] data-plane connected; entering round loop", flush=True)
+        while not self._stop:
+            self._endpoint, self._channel = self._new_channel()
+            s = self._channel.start()
+            if s != SpecDecodeChannel.Status.kOk:
+                # A long-lived draft process may sit idle between target
+                # processes.  TcpRdmaBackend.start() uses
+                # handshake_timeout_s for each accept attempt, so treat an
+                # accept timeout as "no target yet" and keep listening.
+                print(
+                    "[draft] data-plane accept failed: %s; retrying"
+                    % SpecDecodeChannel.to_string(s),
+                    flush=True,
+                )
+                self._channel.stop()
+                time.sleep(0.5)
+                continue
+            s = self._channel.prime_recv(int(self._args.max_num_requests))
+            if s not in (
+                SpecDecodeChannel.Status.kOk,
+                SpecDecodeChannel.Status.kEndpointQueueFull,
+            ):
+                raise RuntimeError("prime_recv failed: " + SpecDecodeChannel.to_string(s))
+            print("[draft] data-plane connected; entering round loop", flush=True)
+            self._serve_data_plane()
+            self._channel.stop()
+            print("[draft] data-plane disconnected; waiting for next target", flush=True)
+
+    def _serve_data_plane(self):
+        assert self._channel is not None
 
         # Lazy slot→request_id binding (mirrors draft_rdma_server_v2.py).
         seen_routes = {}
         while not self._stop:
             status, request_id, received = self._channel.pump_once_for_bound_request()
+            if status == SpecDecodeChannel.Status.kEndpointNotStarted:
+                return
             if status == SpecDecodeChannel.Status.kEndpointEmpty:
                 time.sleep(0.0005)
                 continue
@@ -375,7 +436,7 @@ class DraftTcpServer:
                     "[draft] send failed: %s" % SpecDecodeChannel.to_string(send_status),
                     flush=True,
                 )
-                continue
+                return
             if self._round_count <= 5 or self._round_count % 50 == 0:
                 print(
                     f"[draft] round={self._round_count} req={int(request_id)} "
@@ -383,8 +444,6 @@ class DraftTcpServer:
                     f"last_token={last_token} tokens={draft_tokens[:5]}",
                     flush=True,
                 )
-
-        self._channel.stop()
 
 
 def main() -> int:

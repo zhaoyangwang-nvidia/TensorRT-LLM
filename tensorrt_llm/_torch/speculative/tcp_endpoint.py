@@ -215,6 +215,8 @@ class _TcpRdmaBackend:
                     self._inbox_cv.notify_all()
         except Exception:
             return
+        finally:
+            self._started = False
 
     def _recv_exact(self, n):
         assert self._sock is not None
