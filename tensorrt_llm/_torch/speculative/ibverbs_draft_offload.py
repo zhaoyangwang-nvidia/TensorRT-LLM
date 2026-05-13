@@ -51,7 +51,7 @@ class IbverbsDraftOffloadConfig:
     Mirrors ``DraftOffloadConfig`` from the izzy reference implementation.
     """
 
-    nic_name: str = "mlx5_0"
+    nic_name: str = ""
     server_host: str = "localhost"
     server_port: int = 47000
     remote_peer_name: str = "draft_lpu"
@@ -257,13 +257,11 @@ class IbverbsDraftOffloadLayer(_NN_MODULE_BASE):
     def _ensure_started(self):
         if self._started:
             return
-        # Order matters when transport is tcp/doca: tell the draft
+        # Order matters when transport is tcp/ibverbs/doca: tell the draft
         # server which model to load FIRST (slow — minutes for an 8B
         # model), then open the data-plane socket. Otherwise data-plane
-        # connect() races a not-yet-ready draft. ibverbs uses the
-        # pre-loaded ``draft_rdma_server_v2.py --model ...`` pattern, so
-        # ModelInit is skipped there.
-        if self.config.transport in ("tcp", "doca") and self.config.draft_model_path:
+        # connect() races a not-yet-ready draft.
+        if self.config.transport in ("tcp", "ibverbs", "doca") and self.config.draft_model_path:
             self._push_tcp_model_init()
         status = self._channel.start()
         if status != self._channel_cls.Status.kOk:
@@ -389,7 +387,14 @@ class IbverbsDraftOffloadLayer(_NN_MODULE_BASE):
             "dtype": str(self.config.draft_model_dtype),
             "max_draft_len": int(self.config.max_draft_len),
             "kv_cache_free_fraction": float(self.config.draft_kv_cache_free_fraction),
-            "extra_kwargs_json": "",
+            "extra_kwargs_json": _json.dumps(
+                {
+                    "transport": str(self.config.transport),
+                    "data_port": int(self.config.server_port),
+                    "nic_name": str(self.config.nic_name),
+                    "max_num_requests": int(self.config.max_num_requests),
+                }
+            ),
         }
         port = int(self._tcp_prompt_port if self._tcp_prompt_port > 0 else self.config.server_port)
         sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
@@ -415,11 +420,21 @@ class IbverbsDraftOffloadLayer(_NN_MODULE_BASE):
             raise RuntimeError(
                 "TcpModelInit failed: " + str(ack.get("error", "<no error message>"))
             )
+        data_port = int(ack.get("data_port", 0) or 0)
+        if data_port > 0 and data_port != int(self.config.server_port):
+            self.config.server_port = data_port
+            cfg = getattr(self._endpoint, "_cfg", None)
+            if cfg is not None:
+                if hasattr(cfg, "remote_port"):
+                    cfg.remote_port = data_port
+                if hasattr(cfg, "bind_port") and not getattr(cfg, "is_server", False):
+                    cfg.bind_port = data_port
         _debug_trace(
-            "TcpModelInit ack model=%s vocab=%s eos=%s",
+            "TcpModelInit ack model=%s vocab=%s eos=%s data_port=%s",
             self.config.draft_model_path,
             ack.get("vocab_size"),
             ack.get("eos_token_id"),
+            data_port,
         )
 
     def push_prompt(self, request_id, prompt_tokens):

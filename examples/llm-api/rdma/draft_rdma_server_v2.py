@@ -10,7 +10,7 @@ defined, so it can interoperate with both:
 Modes
 -----
 
-``--backend mock`` (default)
+``--backend mock``
     Returns deterministic dummy tokens (``[1, 2, ..., max_draft_len]``).
     Useful for end-to-end RDMA wiring tests without loading a model.
 
@@ -27,16 +27,15 @@ Run
 ::
 
     # Mock mode (no model needed)
-    python3 draft_rdma_server_v2.py --backend mock --nic mlx5_0 --port 47000
+    python3 draft_rdma_server_v2.py --backend mock --control-port 47001
 
     # Real-model mode (requires container)
-    python3 draft_rdma_server_v2.py --backend transformers --nic mlx5_0 --port 47000 \
-        --model /scratch.trt_llm_data/llm-models/Qwen3/Qwen3-0.6B \
-        --prompt "Explain GPUDirect RDMA in one short sentence."
+    python3 draft_rdma_server_v2.py --control-port 47001
 """
 
 import argparse
 import importlib.util
+import json
 import os
 import signal
 import socket
@@ -75,6 +74,10 @@ try:
         EndpointStatus,
         SpecDecodeChannel,
     )
+    from tensorrt_llm._torch.speculative.tcp_endpoint import (  # noqa: F401,E402
+        TcpEndpointConfig,
+        _TcpRdmaBackend,
+    )
 except Exception:
     # Host fallback — stub the parent packages and load the modules by
     # path.  Only mock/standalone use cases hit this branch.
@@ -111,6 +114,10 @@ except Exception:
         "tensorrt_llm._torch.speculative.ibverbs_endpoint",
         os.path.join(_SPEC_ROOT, "ibverbs_endpoint.py"),
     )
+    _import_module(
+        "tensorrt_llm._torch.speculative.tcp_endpoint",
+        os.path.join(_SPEC_ROOT, "tcp_endpoint.py"),
+    )
 
     from tensorrt_llm._torch.speculative.draft_api_protocol import (
         DraftApiProtocol,  # noqa: F401,E402
@@ -122,6 +129,10 @@ except Exception:
     from tensorrt_llm._torch.speculative.spec_decode_channel import (  # noqa: F401,E402
         EndpointStatus,
         SpecDecodeChannel,
+    )
+    from tensorrt_llm._torch.speculative.tcp_endpoint import (  # noqa: F401,E402
+        TcpEndpointConfig,
+        _TcpRdmaBackend,
     )
 
 # Local module — sits next to this file.
@@ -137,9 +148,18 @@ class _MockBackend:
     def __init__(self, max_draft_len):
         self.max_draft_len = max_draft_len
         self._sessions = {}
+        self.vocab_size = 0
+        self.eos_token_id = 0
+
+    def reset_sessions(self):
+        self._sessions.clear()
+
+    def matches_model_init(self, msg):
+        return int(self.max_draft_len) == int(msg.max_draft_len)
 
     def init_session(self, request_id, prompt_tokens):
         # Mock backend doesn't need real prefill; just remember length.
+        self._sessions.pop(int(request_id), None)
         self._sessions[request_id] = len(prompt_tokens)
         return len(prompt_tokens) - 1  # last_token_position
 
@@ -169,9 +189,12 @@ class _TrtLlmBackend:
         from tensorrt_llm import LLM, SamplingParams
         from tensorrt_llm.llmapi import KvCacheConfig
 
+        self.model_path = str(model_path)
         self.max_draft_len = max_draft_len
         self.device = device
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+        self.vocab_size = int(self.tokenizer.vocab_size)
+        self.eos_token_id = int(self.tokenizer.eos_token_id or 0)
         self.llm = LLM(
             model=model_path,
             kv_cache_config=KvCacheConfig(
@@ -195,7 +218,16 @@ class _TrtLlmBackend:
         # per-round savings without manual KV cache bookkeeping.
         self._sessions = {}
 
+    def reset_sessions(self):
+        self._sessions.clear()
+
+    def matches_model_init(self, msg):
+        return self.model_path == str(msg.model_path) and int(self.max_draft_len) == int(
+            msg.max_draft_len
+        )
+
     def init_session(self, request_id, prompt_tokens):
+        self._sessions.pop(int(request_id), None)
         self._sessions[request_id] = {"tokens": list(prompt_tokens)}
         return len(prompt_tokens) - 1
 
@@ -238,9 +270,12 @@ class _TransformersBackend:
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         self._torch = torch
+        self.model_path = str(model_path)
         self.max_draft_len = max_draft_len
         self.device = device
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+        self.vocab_size = int(self.tokenizer.vocab_size)
+        self.eos_token_id = int(self.tokenizer.eos_token_id or 0)
         self.model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.float16).to(
             device
         )
@@ -251,9 +286,18 @@ class _TransformersBackend:
         # Per-request KV cache, prefill state.
         self._sessions = {}
 
+    def reset_sessions(self):
+        self._sessions.clear()
+
+    def matches_model_init(self, msg):
+        return self.model_path == str(msg.model_path) and int(self.max_draft_len) == int(
+            msg.max_draft_len
+        )
+
     def init_session(self, request_id, prompt_tokens):
         """Phase 7 TCP-prefill entry point — prefill an explicit prompt."""
         torch = self._torch
+        self._sessions.pop(int(request_id), None)
         ids = torch.tensor([list(prompt_tokens)], device=self.device)
         with torch.no_grad():
             out = self.model(ids, use_cache=True, past_key_values=None)
@@ -318,25 +362,53 @@ class _TransformersBackend:
 class IzzyCompatibleDraftServer:
     """RDMA draft server speaking the 96-byte Draft API protocol."""
 
-    def __init__(self, args, backend):
+    def __init__(self, args, backend=None):
         self._args = args
         self._backend = backend
-        endpoint_cfg = IbverbsEndpointConfig(
-            nic_name=args.nic,
-            is_server=True,
-            local_port=args.port,
-            remote_host="0.0.0.0",
-            remote_port=args.port,
-            payload_bytes=DraftApiProtocol.kMessageBytes,
-            recv_queue_depth=args.max_num_requests,
-            max_num_requests=args.max_num_requests,
-        )
-        self._endpoint = _IbverbsRdmaBackend(endpoint_cfg)
-        self._channel = SpecDecodeChannel(self._endpoint)
+        self._backend_lock = threading.Lock()
+        self._backend_ready = threading.Event()
+        if backend is not None:
+            self._backend_ready.set()
+        self._data_transport = None
+        self._max_num_requests = 0
+        self._endpoint = None
+        self._channel = None
         self._stop = False
         self._round_count = 0
         self._tcp_listener_thread = None
         self._tcp_listener_socket = None
+
+    def _new_channel(self):
+        transport = str(self._data_transport or "").lower()
+        if not transport:
+            raise RuntimeError("data transport was not provided by target TcpModelInit")
+        if transport == "tcp":
+            endpoint = _TcpRdmaBackend(
+                TcpEndpointConfig(
+                    is_server=True,
+                    bind_host="0.0.0.0",
+                    bind_port=int(self._args.port),
+                    recv_queue_depth=int(self._max_num_requests),
+                    payload_bytes=DraftApiProtocol.kMessageBytes,
+                )
+            )
+        elif transport == "ibverbs":
+            endpoint = _IbverbsRdmaBackend(
+                IbverbsEndpointConfig(
+                    nic_name=self._args.nic,
+                    is_server=True,
+                    local_port=self._args.port,
+                    remote_host="0.0.0.0",
+                    remote_port=self._args.port,
+                    payload_bytes=DraftApiProtocol.kMessageBytes,
+                    recv_queue_depth=self._max_num_requests,
+                    max_num_requests=self._max_num_requests,
+                )
+            )
+        else:
+            raise RuntimeError("unsupported data transport: %s" % transport)
+        self._data_transport = transport
+        return endpoint, SpecDecodeChannel(endpoint)
 
     def stop(self):
         self._stop = True
@@ -347,23 +419,29 @@ class IzzyCompatibleDraftServer:
                 pass
 
     def _start_tcp_prompt_listener(self):
-        """Phase 7: TCP listener for ``TcpPromptInit`` messages."""
-        if self._args.tcp_prompt_port <= 0:
-            return  # disabled
+        """TCP listener for model-init, prompt-init, and cancel messages."""
+        if self._args.control_port <= 0:
+            raise RuntimeError("--control-port is required for lazy model init")
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind(("0.0.0.0", self._args.tcp_prompt_port))
+        srv.bind(("0.0.0.0", self._args.control_port))
         srv.listen(8)
         self._tcp_listener_socket = srv
-        print("[draft-v2] TCP prompt listener: port=%d" % self._args.tcp_prompt_port, flush=True)
+        print("[draft-v2] control listener: port=%d" % self._args.control_port, flush=True)
 
         def _serve_one(client):
             try:
                 while True:
                     raw = draft_session_protocol.recv_line(client, timeout_s=60.0)
                     msg = draft_session_protocol.parse(raw)
-                    if isinstance(msg, draft_session_protocol.TcpPromptInit):
+                    if isinstance(msg, draft_session_protocol.TcpModelInit):
+                        self._handle_model_init(client, msg)
+                    elif isinstance(msg, draft_session_protocol.TcpPromptInit):
                         try:
+                            if not self._backend_ready.is_set():
+                                raise RuntimeError("backend not initialized")
+                            if hasattr(self._backend, "reset_sessions"):
+                                self._backend.reset_sessions()
                             last_pos = self._backend.init_session(
                                 request_id=int(msg.request_id),
                                 prompt_tokens=list(msg.prompt_tokens),
@@ -411,12 +489,123 @@ class IzzyCompatibleDraftServer:
         self._tcp_listener_thread = threading.Thread(target=_listen_loop, daemon=True)
         self._tcp_listener_thread.start()
 
+    def _make_backend_from_model_init(self, msg):
+        if self._args.backend == "mock":
+            return _MockBackend(max_draft_len=int(msg.max_draft_len))
+        if self._args.backend == "transformers":
+            return _TransformersBackend(
+                model_path=msg.model_path,
+                prompt=self._args.prompt,
+                max_draft_len=int(msg.max_draft_len),
+                device=self._args.device,
+            )
+        if self._args.backend == "trtllm":
+            return _TrtLlmBackend(
+                model_path=msg.model_path,
+                prompt=self._args.prompt,
+                max_draft_len=int(msg.max_draft_len),
+                device=self._args.device,
+            )
+        raise RuntimeError("unknown backend")
+
+    @staticmethod
+    def _allocate_free_port():
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.bind(("0.0.0.0", 0))
+            return int(sock.getsockname()[1])
+        finally:
+            sock.close()
+
+    def _ensure_data_port(self):
+        if int(self._args.port) <= 0:
+            self._args.port = self._allocate_free_port()
+
+    def _handle_model_init(self, client, msg):
+        with self._backend_lock:
+            try:
+                extra = json.loads(msg.extra_kwargs_json or "{}")
+            except Exception:
+                extra = {}
+            requested_transport = str(extra.get("transport", "")).lower()
+            if requested_transport not in ("tcp", "ibverbs"):
+                ack = draft_session_protocol.TcpModelInitAck(
+                    status="error",
+                    error="target must provide data transport tcp|ibverbs in TcpModelInit",
+                )
+                client.sendall(draft_session_protocol.serialize(ack))
+                return
+            self._data_transport = requested_transport
+            try:
+                extra_max = int(extra.get("max_num_requests", 0))
+            except Exception:
+                extra_max = 0
+            if extra_max <= 0:
+                ack = draft_session_protocol.TcpModelInitAck(
+                    status="error",
+                    error="target must provide max_num_requests in TcpModelInit",
+                )
+                client.sendall(draft_session_protocol.serialize(ack))
+                return
+            self._max_num_requests = extra_max
+            self._ensure_data_port()
+
+            if self._backend is not None:
+                if self._backend.matches_model_init(msg):
+                    self._backend.reset_sessions()
+                    ack = draft_session_protocol.TcpModelInitAck(
+                        status="ok",
+                        vocab_size=int(getattr(self._backend, "vocab_size", 0)),
+                        eos_token_id=int(getattr(self._backend, "eos_token_id", 0)),
+                        data_port=int(self._args.port),
+                    )
+                    print(
+                        "[draft-v2] model_init reused existing model=%s; cleared sessions"
+                        % msg.model_path,
+                        flush=True,
+                    )
+                    client.sendall(draft_session_protocol.serialize(ack))
+                    return
+                print(
+                    "[draft-v2] model changed; reloading old=%s new=%s"
+                    % (getattr(self._backend, "model_path", "<mock>"), msg.model_path),
+                    flush=True,
+                )
+                self._backend = None
+                self._backend_ready.clear()
+            try:
+                self._backend = self._make_backend_from_model_init(msg)
+                self._backend_ready.set()
+                ack = draft_session_protocol.TcpModelInitAck(
+                    status="ok",
+                    vocab_size=int(getattr(self._backend, "vocab_size", 0)),
+                    eos_token_id=int(getattr(self._backend, "eos_token_id", 0)),
+                    data_port=int(self._args.port),
+                )
+            except Exception as exc:
+                self._backend = None
+                ack = draft_session_protocol.TcpModelInitAck(status="error", error=str(exc))
+                print("[draft-v2] model_init failed: %r" % exc, flush=True)
+            client.sendall(draft_session_protocol.serialize(ack))
+
     def run(self):
         self._start_tcp_prompt_listener()
+        print(
+            "[draft-v2] waiting for TcpModelInit on port %d ..." % self._args.control_port,
+            flush=True,
+        )
+        if not self._backend_ready.wait(timeout=float(self._args.backend_init_timeout_s)):
+            raise RuntimeError("timed out waiting for TcpModelInit")
+        print(
+            "[draft-v2] backend ready; opening %s data-plane port %d"
+            % (self._data_transport, self._args.port),
+            flush=True,
+        )
+        self._endpoint, self._channel = self._new_channel()
         s = self._channel.start()
         if s != SpecDecodeChannel.Status.kOk:
             raise RuntimeError("channel.start failed: " + SpecDecodeChannel.to_string(s))
-        s = self._channel.prime_recv(self._args.max_num_requests)
+        s = self._channel.prime_recv(self._max_num_requests)
         if s not in (SpecDecodeChannel.Status.kOk, SpecDecodeChannel.Status.kEndpointQueueFull):
             raise RuntimeError("prime_recv failed: " + SpecDecodeChannel.to_string(s))
 
@@ -425,7 +614,7 @@ class IzzyCompatibleDraftServer:
             % (
                 self._args.nic,
                 self._args.port,
-                self._args.max_num_requests,
+                self._max_num_requests,
                 type(self._backend).__name__,
             ),
             flush=True,
@@ -438,6 +627,8 @@ class IzzyCompatibleDraftServer:
         while not self._stop:
             status, request_id, received = self._channel.pump_once_for_bound_request()
 
+            if status == SpecDecodeChannel.Status.kEndpointNotStarted:
+                break
             if status == SpecDecodeChannel.Status.kEndpointEmpty:
                 time.sleep(0.0005)
                 continue
@@ -516,7 +707,7 @@ class IzzyCompatibleDraftServer:
                     "[draft-v2] send failed: %s" % SpecDecodeChannel.to_string(send_status),
                     flush=True,
                 )
-                continue
+                break
             if self._round_count <= 5 or self._round_count % 50 == 0:
                 print(
                     "[draft-v2] round=%d req=%d slot=%d round_seq=%d last_token=%d "
@@ -537,49 +728,46 @@ class IzzyCompatibleDraftServer:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--nic", default="mlx5_0")
-    ap.add_argument("--port", type=int, default=47000)
-    ap.add_argument("--max-num-requests", type=int, default=64)
-    ap.add_argument("--max-draft-len", type=int, default=5)
-    ap.add_argument("--backend", choices=["mock", "transformers", "trtllm"], default="mock")
+    ap.add_argument(
+        "--nic", default="", help="RDMA device. Empty means choose the first available."
+    )
+    ap.add_argument(
+        "--port",
+        type=int,
+        default=0,
+        help="Data-plane port. 0 means allocate a free port and return it in TcpModelInitAck.",
+    )
+    ap.add_argument("--backend", choices=["mock", "transformers", "trtllm"], default="trtllm")
+    ap.add_argument(
+        "--control-port",
+        type=int,
+        default=0,
+        help="TCP control-plane port for model-init / prompt-init / cancel",
+    )
     ap.add_argument(
         "--tcp-prompt-port",
         type=int,
         default=0,
-        help="TCP port for prompt-init control channel (0 = disabled)",
+        help="Deprecated alias for --control-port",
     )
     # transformers-backend args
-    ap.add_argument("--model", default=None, help="HF model path (transformers backend only)")
+    ap.add_argument(
+        "--model",
+        default=None,
+        help="Deprecated for lazy mode; target sends the model path via TcpModelInit",
+    )
     ap.add_argument(
         "--prompt", default=None, help="fixed prompt for stateful sessions (transformers backend)"
     )
     ap.add_argument("--device", default="cuda:0")
+    ap.add_argument("--backend-init-timeout-s", type=float, default=600.0)
     args = ap.parse_args()
+    if args.control_port <= 0 and args.tcp_prompt_port > 0:
+        args.control_port = args.tcp_prompt_port
+    if args.control_port <= 0:
+        ap.error("--control-port is required")
 
-    if args.backend == "mock":
-        backend = _MockBackend(max_draft_len=args.max_draft_len)
-    elif args.backend == "transformers":
-        if args.model is None:
-            ap.error("--model is required for --backend transformers")
-        backend = _TransformersBackend(
-            model_path=args.model,
-            prompt=args.prompt,
-            max_draft_len=args.max_draft_len,
-            device=args.device,
-        )
-    elif args.backend == "trtllm":
-        if args.model is None:
-            ap.error("--model is required for --backend trtllm")
-        backend = _TrtLlmBackend(
-            model_path=args.model,
-            prompt=args.prompt,
-            max_draft_len=args.max_draft_len,
-            device=args.device,
-        )
-    else:
-        raise RuntimeError("unknown backend")
-
-    server = IzzyCompatibleDraftServer(args, backend)
+    server = IzzyCompatibleDraftServer(args)
 
     def _sig(*_):
         print("[draft-v2] received signal, shutting down...", flush=True)

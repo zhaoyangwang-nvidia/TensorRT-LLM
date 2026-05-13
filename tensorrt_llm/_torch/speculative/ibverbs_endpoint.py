@@ -108,7 +108,7 @@ class IbverbsEndpointConfig:
     """
 
     gpu_id: int = 0
-    nic_name: str = "mlx5_0"
+    nic_name: str = ""
     remote_host: str = "localhost"
     remote_port: int = 47000
     remote_peer_name: str = "draft_lpu"
@@ -607,16 +607,26 @@ class _IbverbsRdmaBackend:
             raise RuntimeError("ibv_get_device_list returned NULL")
         try:
             target = None
+            first_name = None
             for i in range(cnt.value):
                 dev = devs[i]
                 if not dev:
                     continue
                 nm = self._libverbs.ibv_get_device_name(dev)
-                if nm and nm.decode() == self._cfg.nic_name:
+                if not nm:
+                    continue
+                name = nm.decode()
+                if first_name is None:
+                    first_name = name
+                if self._cfg.nic_name and name == self._cfg.nic_name:
                     target = dev
                     break
+                if not self._cfg.nic_name and target is None:
+                    target = dev
             if target is None:
                 raise RuntimeError("device %r not found" % self._cfg.nic_name)
+            if not self._cfg.nic_name and first_name is not None:
+                self._cfg.nic_name = first_name
             self._ctx = self._libverbs.ibv_open_device(target)
             if not self._ctx:
                 raise RuntimeError("ibv_open_device(%r) failed" % self._cfg.nic_name)
@@ -819,9 +829,26 @@ class _IbverbsRdmaBackend:
             finally:
                 client.close()
         else:
-            client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            deadline = time.monotonic() + float(self._cfg.handshake_timeout_s)
+            last_err = None
+            client = None
+            while time.monotonic() < deadline:
+                client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                client.settimeout(10.0)
+                try:
+                    client.connect((self._cfg.remote_host, self._cfg.remote_port))
+                    break
+                except (ConnectionRefusedError, socket.timeout, OSError) as exc:
+                    last_err = exc
+                    try:
+                        client.close()
+                    except OSError:
+                        pass
+                    client = None
+                    time.sleep(0.2)
+            if client is None:
+                raise last_err or RuntimeError("ibverbs TCP handshake connect failed")
             client.settimeout(self._cfg.handshake_timeout_s)
-            client.connect((self._cfg.remote_host, self._cfg.remote_port))
             try:
                 _send_json_line(client, my_payload)
                 peer = _recv_json_line(client, self._cfg.handshake_timeout_s)

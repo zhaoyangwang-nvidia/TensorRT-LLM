@@ -35,8 +35,8 @@ def main() -> int:
     ap.add_argument(
         "--draft-port",
         type=int,
-        default=47900,
-        help="Draft data-plane port (matches --port on the draft server)",
+        default=0,
+        help="Draft data-plane port. 0 lets the draft server allocate and return one via control-plane ack.",
     )
     ap.add_argument(
         "--draft-control-port",
@@ -54,8 +54,8 @@ def main() -> int:
     )
     ap.add_argument(
         "--nic",
-        default="mlx5_0",
-        help="NIC device for --transport ibverbs.",
+        default="",
+        help="NIC device for --transport ibverbs. Empty means choose the first available RDMA device.",
     )
     ap.add_argument("--prompt", default="Explain GPUDirect RDMA in one short sentence.")
     ap.add_argument(
@@ -66,8 +66,8 @@ def main() -> int:
     ap.add_argument(
         "--max-num-requests",
         type=int,
-        default=16,
-        help="Matches draft server --max-num-requests (controls channel slot count).",
+        default=4096,
+        help="Channel slot count sent to the draft server during TcpModelInit.",
     )
     ap.add_argument(
         "--kv-cache-free-fraction",
@@ -100,14 +100,18 @@ def main() -> int:
             draft_offload_enabled=True,
             draft_offload_v2=True,
             draft_offload_server_host=args.draft_host,
-            draft_offload_server_port=args.draft_port,
+            # Pydantic requires a valid TCP port even when the draft
+            # server will allocate the real data-plane port and return it
+            # in TcpModelInitAck.  Use a harmless placeholder here; the
+            # offload layer overwrites it before endpoint.start().
+            draft_offload_server_port=args.draft_port or 1,
             draft_offload_v2_max_num_requests=args.max_num_requests,
             draft_offload_v2_transport=args.transport,
             draft_offload_v2_kv_cache_free_fraction=args.kv_cache_free_fraction,
             draft_offload_v2_tcp_prompt_port=args.draft_control_port,
         )
-        if args.transport in ("tcp", "doca"):
-            # TCP / DOCA paths lazily load the draft model via
+        if args.transport in ("tcp", "ibverbs", "doca"):
+            # TCP / ibverbs / DOCA paths lazily load the draft model via
             # TcpModelInit; pass the path through.
             spec_kwargs["draft_offload_v2_model_path"] = args.draft_model
         if args.transport in ("ibverbs", "doca"):

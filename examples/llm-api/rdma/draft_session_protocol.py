@@ -50,6 +50,7 @@ class TcpModelInitAck:
     error: Optional[str] = None
     vocab_size: int = 0
     eos_token_id: int = 0
+    data_port: int = 0
     msg_type: str = "model_init_ack"
 
 
@@ -106,6 +107,7 @@ def parse(raw: bytes):
             error=obj.get("error"),
             vocab_size=int(obj.get("vocab_size", 0)),
             eos_token_id=int(obj.get("eos_token_id", 0)),
+            data_port=int(obj.get("data_port", 0)),
         )
     if mt == TcpPromptInit.msg_type:
         return TcpPromptInit(
