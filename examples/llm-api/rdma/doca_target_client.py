@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """DOCA RDMA target client driving N speculative-decoding rounds.
 
-Connects to ``doca_draft_server.py`` over CPU_PROXY DOCA, sends a
+Connects to a DOCA CPU_PROXY draft endpoint, sends a
 TargetToDraft frame each round, then receives the draft's reply.
 
 To keep this harness focused on the transport (rather than a real
