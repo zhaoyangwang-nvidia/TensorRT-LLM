@@ -69,10 +69,8 @@ __global__ void rdma_write_imm_kernel(doca_gpu_dev_verbs_qp* qp, void* local_buf
     uint64_t wqe_idx = doca_gpu_dev_verbs_reserve_wq_slots(qp, 1);
     doca_gpu_dev_verbs_wqe* wqe_ptr = doca_gpu_dev_verbs_get_wqe_ptr(qp, wqe_idx);
 
-    // For diagnostic: when imm_value==0, use plain RDMA_WRITE (no IMM); responder needs no recv WR.
-    uint8_t op = (imm_value == 0) ? MLX5_OPCODE_RDMA_WRITE : MLX5_OPCODE_RDMA_WRITE_IMM;
-    doca_gpu_dev_verbs_wqe_prepare_write(qp, wqe_ptr, wqe_idx, op, DOCA_GPUNETIO_MLX5_WQE_CTRL_CQ_UPDATE, imm_be,
-        remote_addr, rkey_be, (uint64_t) local_buf, lkey_be, size);
+    doca_gpu_dev_verbs_wqe_prepare_write(qp, wqe_ptr, wqe_idx, MLX5_OPCODE_RDMA_WRITE_IMM,
+        DOCA_GPUNETIO_MLX5_WQE_CTRL_CQ_UPDATE, imm_be, remote_addr, rkey_be, (uint64_t) local_buf, lkey_be, size);
 
     doca_gpu_dev_verbs_mark_wqes_ready(qp, wqe_idx, wqe_idx);
     doca_gpu_dev_verbs_submit(qp, wqe_idx + 1);

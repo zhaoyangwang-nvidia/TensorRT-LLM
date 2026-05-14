@@ -12,44 +12,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Endpoint protocol implementation over DOCA RDMA + CPU_PROXY doorbell.
+"""Endpoint protocol implementation over DOCA RDMA WRITE_WITH_IMM.
 
-Third leg of the 4-phase draft-offload transport progression. Uses the
-izzy ``doca_rdma`` pybind extension (must be built and present at
-``--doca-rdma-build`` or ``$DOCA_RDMA_BUILD``, typically
-``/opt/doca_rdma_izzy/build``).
-
-Wire frame is 104 bytes total:
-
-    bytes [0 :  4)   little-endian uint32 ``imm_data`` (routing)
-    bytes [4 :100)   96-byte ``DraftApiProtocol`` payload
-    bytes [100:104)  little-endian uint32 monotonic poll counter
-
-``imm_data`` is carried in the frame rather than via mlx5
-WRITE_WITH_IMM because the CPU_PROXY path on ConnectX-7 + DOCA 3.3 +
-MLNX_OFED 25.07 cannot post recv WRs on the external-datapath QP (see
-``phase10_doca_cuda_graph.md`` task #29). The poll counter is
-incremented on each send so the receiver's spin-poll observes a unique
-value — RC ordering guarantees the responder commits one RDMA_WRITE in
-increasing-address order, so seeing a new counter value implies the
-imm_data and payload bytes are already in memory.
-
-A GPU kernel (``torch.ops.doca_rdma.write_with_imm`` with ``imm=0``,
-selected by our izzy patch as plain ``RDMA_WRITE``) issues the WQE. A
-daemon thread on each side drives ``cpu_proxy_progress`` so the NIC
-doorbell rings without blocking the spec-decode engine.
-
-Caveat: TRT-LLM's torch caching allocator and DOCA's
-``doca_gpu_mem_alloc`` share the same CUDA virtual-address space and
-can collide. See ``phase13_doca_cpu_proxy.md`` for the failure mode
-and the mitigations (host-pinned DOCA buffers, allocator pre-warm,
-two-process split).
+This follows Izzy's original data path: the GPU submits an RDMA
+WRITE_WITH_IMM WQE, the 96-byte DraftApiProtocol payload is written to
+the peer's receive buffer, and the 32-bit routing word is delivered as
+hardware immediate data in the receive CQE. The receiver pre-posts empty
+receive WRs and polls the GPU receive CQ for completions.
 """
 
 from __future__ import annotations
 
 import os
-import struct
 import sys
 import threading
 import time
@@ -61,13 +35,36 @@ from typing import Optional
 from .draft_api_protocol import DraftApiProtocol
 from .spec_decode_channel import EndpointPacket, EndpointStatus
 
-_IMM_BYTES = 4
-_SIGNAL_BYTES = 4
-_FRAME_BYTES = _IMM_BYTES + DraftApiProtocol.kMessageBytes + _SIGNAL_BYTES  # = 104
 # izzy's allocator packs small allocations into a shared CUDA region,
 # which can alias send and recv buffers. Ask for a whole page each so
 # the addresses are distinct.
 _BUF_BYTES = 4096
+_POST_RECV_BATCH = 32
+
+
+def _env_enabled(name: str) -> bool:
+    value = str(os.environ.get(name, "")).strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def _debug_trace(message, *args) -> None:
+    if not _env_enabled("TLLM_RDMA_DEBUG_TRACE"):
+        return
+    trace_path = os.environ.get("TLLM_RDMA_DEBUG_TRACE_PATH", "/tmp/tllm_rdma_trace.log")
+    if not trace_path:
+        return
+    try:
+        rendered = message % args if args else message
+    except Exception:
+        rendered = "%s args=%r" % (message, args)
+    try:
+        with open(trace_path, "a", encoding="utf-8") as handle:
+            handle.write(
+                "%s pid=%d doca_endpoint %s\n"
+                % (time.strftime("%Y-%m-%d %H:%M:%S"), os.getpid(), rendered)
+            )
+    except Exception:
+        pass
 
 
 @dataclass
@@ -113,6 +110,7 @@ def _resolve_izzy_build_dir(build_dir: Optional[str]) -> str:
 def _load_izzy(build_dir: Optional[str]):
     """Import izzy's pybind module + load its torch ops .so."""
     path = _resolve_izzy_build_dir(build_dir)
+    _debug_trace("load izzy build_dir=%s resolved_path=%s", build_dir, path)
     if path and path not in sys.path:
         sys.path.insert(0, path)
     import torch
@@ -120,22 +118,22 @@ def _load_izzy(build_dir: Optional[str]):
     ops_path = os.path.join(path, "doca_rdma_ops.so")
     if os.path.exists(ops_path):
         try:
+            _debug_trace("load torch ops path=%s", ops_path)
             torch.ops.load_library(ops_path)
         except RuntimeError:
             # Already loaded — fine.
+            _debug_trace("torch ops already loaded path=%s", ops_path)
             pass
+    else:
+        _debug_trace("torch ops missing path=%s", ops_path)
     import doca_rdma  # noqa: E402
 
+    _debug_trace("imported doca_rdma module=%s", getattr(doca_rdma, "__file__", None))
     return doca_rdma
 
 
 class _DocaEndpointBackend:
-    """``Endpoint`` Protocol over izzy ``doca_rdma`` + CPU_PROXY.
-
-    GPU kernel emits one ``RDMA_WRITE`` per ``send``; a CPU progress
-    thread drives the NIC doorbell. The receiver polls the trailing
-    4-byte signal of the recv buffer for new frames.
-    """
+    """``Endpoint`` Protocol over izzy ``doca_rdma`` WRITE_WITH_IMM."""
 
     def __init__(self, config: DocaEndpointConfig):
         self._cfg = config
@@ -144,14 +142,13 @@ class _DocaEndpointBackend:
         self._send_buf = None  # izzy BufferInfo
         self._recv_buf = None
         self._send_payload = None  # torch tensor view of send buffer
-        self._send_signal = None
         self._recv_payload = None
-        self._recv_signal = None
         self._send_seq = 0
-        self._last_recv_seq = 0
         self._progress_stop = threading.Event()
-        self._progress_thread: Optional[threading.Thread] = None
         self._poll_thread: Optional[threading.Thread] = None
+        self._recv_wq_idx = None
+        self._recv_cq_idx = None
+        self._recv_imm_out = None
 
         self._inbox = deque()
         self._inbox_lock = threading.Lock()
@@ -177,42 +174,81 @@ class _DocaEndpointBackend:
 
     def start(self):
         if self._started:
+            _debug_trace("start skipped already started")
             return EndpointStatus.kOk
         try:
+            mode = "server" if self._cfg.is_server else "client"
+            port = int(
+                (self._cfg.bind_port or self._cfg.remote_port)
+                if self._cfg.is_server
+                else self._cfg.remote_port
+            )
+            _debug_trace(
+                "start mode=%s gpu_id=%s nic=%s remote_host=%s port=%s bind_port=%s "
+                "peer=%s queue_depth=%s payload_bytes=%s timeout_s=%s izzy_build=%s",
+                mode,
+                self._cfg.gpu_id,
+                self._cfg.nic_name,
+                self._cfg.remote_host,
+                port,
+                self._cfg.bind_port,
+                self._cfg.remote_peer_name,
+                self._cfg.recv_queue_depth,
+                self._cfg.payload_bytes,
+                self._cfg.handshake_timeout_s,
+                _resolve_izzy_build_dir(self._cfg.izzy_build_dir),
+            )
             self._doca = _load_izzy(self._cfg.izzy_build_dir)
             import torch
 
+            _debug_trace("cuda set_device gpu_id=%s", self._cfg.gpu_id)
             torch.cuda.set_device(int(self._cfg.gpu_id))
             self._ep = self._doca.DocaRdmaEndpoint()
+            _debug_trace(
+                "endpoint init begin gpu_id=%s nic=%s",
+                self._cfg.gpu_id,
+                self._cfg.nic_name,
+            )
             self._ep.init(int(self._cfg.gpu_id), str(self._cfg.nic_name))
+            _debug_trace("endpoint init ok")
+            _debug_trace("alloc send buffer bytes=%s", _BUF_BYTES)
             self._send_buf = self._ep.alloc_doca_gpu_buffer(_BUF_BYTES)
+            _debug_trace(
+                "alloc send buffer ok addr=%s lkey=%s rkey=%s",
+                getattr(self._send_buf, "addr", None),
+                getattr(self._send_buf, "lkey", None),
+                getattr(self._send_buf, "rkey", None),
+            )
+            _debug_trace("alloc recv buffer bytes=%s", _BUF_BYTES)
             self._recv_buf = self._ep.alloc_doca_gpu_buffer(_BUF_BYTES)
+            _debug_trace(
+                "alloc recv buffer ok addr=%s lkey=%s rkey=%s",
+                getattr(self._recv_buf, "addr", None),
+                getattr(self._recv_buf, "lkey", None),
+                getattr(self._recv_buf, "rkey", None),
+            )
 
+            _debug_trace("wrap send payload")
             self._send_payload = torch.ops.doca_rdma.wrap_gpu_memory(
                 self._send_buf.addr, _BUF_BYTES, int(self._cfg.gpu_id)
             ).view(torch.uint8)
-            self._send_signal = torch.ops.doca_rdma.wrap_gpu_memory(
-                self._send_buf.addr + _IMM_BYTES + DraftApiProtocol.kMessageBytes,
-                _SIGNAL_BYTES,
-                int(self._cfg.gpu_id),
-            ).view(torch.int32)
+            _debug_trace("wrap recv payload")
             self._recv_payload = torch.ops.doca_rdma.wrap_gpu_memory(
                 self._recv_buf.addr, _BUF_BYTES, int(self._cfg.gpu_id)
             ).view(torch.uint8)
-            self._recv_signal = torch.ops.doca_rdma.wrap_gpu_memory(
-                self._recv_buf.addr + _IMM_BYTES + DraftApiProtocol.kMessageBytes,
-                _SIGNAL_BYTES,
-                int(self._cfg.gpu_id),
-            ).view(torch.int32)
 
+            _debug_trace("zero buffers begin")
             self._send_payload.zero_()
             self._recv_payload.zero_()
             torch.cuda.synchronize()
+            _debug_trace("zero buffers ok")
 
             peer = str(self._cfg.remote_peer_name)
             if self._cfg.is_server:
                 port = int(self._cfg.bind_port or self._cfg.remote_port)
+                _debug_trace("accept peer begin port=%s peer=%s", port, peer)
                 ok = self._ep.accept_peer(port, peer)
+                _debug_trace("accept peer result ok=%s", ok)
             else:
                 # The draft side may still be opening its DOCA accept
                 # port after loading the model. Retry connect until
@@ -222,23 +258,54 @@ class _DocaEndpointBackend:
                 attempt = 0
                 while time.monotonic() < deadline:
                     attempt += 1
+                    _debug_trace(
+                        "connect peer attempt=%s host=%s port=%s peer=%s",
+                        attempt,
+                        self._cfg.remote_host,
+                        self._cfg.remote_port,
+                        peer,
+                    )
                     ok = self._ep.connect_to_peer(
                         str(self._cfg.remote_host), int(self._cfg.remote_port), peer
                     )
                     if ok:
+                        _debug_trace("connect peer ok attempt=%s", attempt)
                         break
                     time.sleep(1.0)
+                if not ok:
+                    _debug_trace("connect peer failed attempts=%s", attempt)
             if not ok:
+                _debug_trace("peer handshake failed")
                 return EndpointStatus.kError
+            _debug_trace(
+                "exchange buffer info begin peer=%s send_addr=%s recv_addr=%s",
+                peer,
+                getattr(self._send_buf, "addr", None),
+                getattr(self._recv_buf, "addr", None),
+            )
             ok = self._ep.exchange_buffer_info(peer, self._send_buf, self._recv_buf)
             if not ok:
+                _debug_trace("exchange buffer info failed")
                 return EndpointStatus.kError
+            _debug_trace("exchange buffer info ok")
+
+            qp_ptr = self._ep.get_qp_dev_ptr(peer)
+            self._recv_wq_idx = torch.zeros(
+                1, dtype=torch.int64, device=f"cuda:{int(self._cfg.gpu_id)}"
+            )
+            self._recv_cq_idx = torch.zeros(
+                1, dtype=torch.int64, device=f"cuda:{int(self._cfg.gpu_id)}"
+            )
+            self._recv_imm_out = torch.zeros(
+                1, dtype=torch.int32, device=f"cuda:{int(self._cfg.gpu_id)}"
+            )
+            post_count = min(max(1, int(self._cfg.recv_queue_depth)), _POST_RECV_BATCH)
+            _debug_trace("post recv WRs begin peer=%s count=%s", peer, post_count)
+            torch.ops.doca_rdma.post_recv_wrs(qp_ptr, self._recv_wq_idx, post_count)
+            torch.cuda.synchronize()
+            _debug_trace("post recv WRs ok")
 
             self._progress_stop.clear()
-            self._progress_thread = threading.Thread(
-                target=self._progress_loop, name="DocaEp-progress", daemon=True
-            )
-            self._progress_thread.start()
             self._poll_thread = threading.Thread(
                 target=self._poll_loop, name="DocaEp-poll", daemon=True
             )
@@ -248,8 +315,10 @@ class _DocaEndpointBackend:
                 target=self._send_worker_loop, name="DocaEp-send", daemon=True
             )
             self._send_thread.start()
+            _debug_trace("start ok threads started")
             return EndpointStatus.kOk
-        except Exception:
+        except Exception as exc:
+            _debug_trace("start exception: %r", exc)
             self._cleanup()
             return EndpointStatus.kError
 
@@ -314,20 +383,15 @@ class _DocaEndpointBackend:
         caller. Single-threaded — guarantees strict round-by-round
         ordering of WQEs into the SQ.
 
-        The 104-byte frame is written via ``ctypes.memmove`` directly
-        into the host-pinned send buffer (host_ptr == dev_ptr under our
-        ``GLUE_DOCA_HOST_PINNED_BUFFERS=1`` patch), avoiding the
-        ``torch.Tensor.copy_`` path that interacts badly with
-        InferenceMode and TRT-LLM's stream scheduler.
+        The payload is copied into the DOCA-allocated GPU send buffer,
+        then sent with hardware immediate data. The receiver gets the
+        routing word from the CQE, matching Izzy's original mock client.
         """
-        import ctypes
-
         import torch
 
         torch.cuda.set_device(int(self._cfg.gpu_id))
         sender_stream = torch.cuda.Stream(device=int(self._cfg.gpu_id))
         peer = self._cfg.remote_peer_name
-        send_addr = ctypes.c_void_p(self._send_buf.addr)
         with torch.inference_mode():
             while True:
                 with self._send_queue_cv:
@@ -337,18 +401,13 @@ class _DocaEndpointBackend:
                         return
                     my_seq, imm32, payload = self._send_queue.popleft()
 
-                frame = bytearray(_IMM_BYTES + DraftApiProtocol.kMessageBytes + _SIGNAL_BYTES)
-                struct.pack_into("<I", frame, 0, imm32)
-                frame[_IMM_BYTES : _IMM_BYTES + DraftApiProtocol.kMessageBytes] = payload
-                struct.pack_into("<I", frame, _IMM_BYTES + DraftApiProtocol.kMessageBytes, my_seq)
-                # Host-pinned mapped GPU buffer: ``send_buf.addr`` is the
-                # device pointer == the host pointer under cudaHostAlloc
-                # + cudaHostGetDevicePointer. Writing it from CPU is
-                # safe and visible to the NIC after the SQ DBR ring.
-                src = (ctypes.c_uint8 * _FRAME_BYTES).from_buffer(frame[:_FRAME_BYTES])
-                ctypes.memmove(send_addr, ctypes.addressof(src), _FRAME_BYTES)
-
                 with torch.cuda.stream(sender_stream):
+                    src = torch.tensor(
+                        list(payload),
+                        dtype=torch.uint8,
+                        device=f"cuda:{int(self._cfg.gpu_id)}",
+                    )
+                    self._send_payload[: DraftApiProtocol.kMessageBytes].copy_(src)
                     remote = self._ep.get_remote_recv_buf(peer)
                     local_send = self._ep.get_local_send_buf(peer)
                     qp_ptr = self._ep.get_qp_dev_ptr(peer)
@@ -358,13 +417,14 @@ class _DocaEndpointBackend:
                     torch.ops.doca_rdma.write_with_imm(
                         qp_ptr,
                         local_send.addr,
-                        _FRAME_BYTES,
+                        DraftApiProtocol.kMessageBytes,
                         local_send.lkey,
                         remote.addr,
                         remote.rkey,
-                        0,
+                        imm32,
                         wqe_out,
                     )
+                    torch.ops.doca_rdma.wait_send(qp_ptr, self._send_payload, wqe_out)
                     sender_stream.synchronize()
                 # Force the wqe_idx readback so the kernel is observed
                 # to have completed before we mark the seq done.
@@ -386,34 +446,35 @@ class _DocaEndpointBackend:
     # Background threads
     # ------------------------------------------------------------------
 
-    def _progress_loop(self):
-        while not self._progress_stop.is_set():
-            try:
-                self._ep.cpu_proxy_progress(self._cfg.remote_peer_name)
-            except Exception:
-                return
-
     def _poll_loop(self):
-        # Spins on the trailing signal of the recv buffer. When the
-        # signal counter advances, the responder's RC ordering
-        # guarantees the imm_data + payload bytes are already in
-        # memory, so we pop the head and push as an EndpointPacket.
-        while not self._progress_stop.is_set():
-            try:
-                cur = int(self._recv_signal.cpu().item())
-            except Exception:
-                return
-            if cur != self._last_recv_seq:
-                self._last_recv_seq = cur
-                head = bytes(
-                    self._recv_payload[: _IMM_BYTES + DraftApiProtocol.kMessageBytes].cpu().tolist()
-                )
-                imm = struct.unpack("<I", head[:_IMM_BYTES])[0]
-                payload = head[_IMM_BYTES:]
-                with self._inbox_lock:
-                    self._inbox.append(EndpointPacket(imm_data=int(imm), payload=payload))
-            else:
-                time.sleep(0.0005)
+        import torch
+
+        torch.cuda.set_device(int(self._cfg.gpu_id))
+        poll_stream = torch.cuda.Stream(device=int(self._cfg.gpu_id))
+        peer = self._cfg.remote_peer_name
+        qp_ptr = self._ep.get_qp_dev_ptr(peer)
+        with torch.inference_mode():
+            while not self._progress_stop.is_set():
+                try:
+                    with torch.cuda.stream(poll_stream):
+                        completed = torch.ops.doca_rdma.poll_recv(
+                            qp_ptr, self._recv_cq_idx, self._recv_imm_out
+                        )
+                        poll_stream.synchronize()
+                    if int(completed.cpu().item()) == 0:
+                        time.sleep(0.0005)
+                        continue
+                    imm = int(self._recv_imm_out.cpu().item()) & 0xFFFFFFFF
+                    payload = bytes(
+                        self._recv_payload[: DraftApiProtocol.kMessageBytes].cpu().tolist()
+                    )
+                    with self._inbox_lock:
+                        self._inbox.append(EndpointPacket(imm_data=imm, payload=payload))
+                    with torch.cuda.stream(poll_stream):
+                        torch.ops.doca_rdma.post_recv_wrs(qp_ptr, self._recv_wq_idx, 1)
+                        poll_stream.synchronize()
+                except Exception:
+                    return
 
     def _cleanup(self):
         self._progress_stop.set()
