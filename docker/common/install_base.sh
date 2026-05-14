@@ -68,6 +68,13 @@ install_doca_ubuntu() {
     ibverbs-utils \
     ibverbs-providers
 
+  dpkg-query -W 'doca-*' 'libdoca-*' 2>/dev/null || true
+  if [ -e "/opt/mellanox/doca/lib/${doca_lib_arch}/libdoca_gpunetio.so" ] &&
+     readelf -d "/opt/mellanox/doca/lib/${doca_lib_arch}/libdoca_gpunetio.so" | grep -q "libcudart.so.12"; then
+    echo "ERROR: libdoca_gpunetio.so still links against libcudart.so.12; expected DOCA ${DOCA_VERSION} CUDA-13-compatible packages." >&2
+    exit 1
+  fi
+
   if [ -d /opt/mellanox/doca/include ]; then
     ln -sf /opt/mellanox/doca/include/*.h /usr/local/cuda/include/ 2>/dev/null || true
     ln -sf /opt/mellanox/doca/include/*.cuh /usr/local/cuda/include/ 2>/dev/null || true
