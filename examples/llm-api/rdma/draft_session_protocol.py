@@ -32,7 +32,7 @@ class TcpModelInit:
     """Sent by target → draft to make draft lazy-load a model.
 
     Targets specify the local path that the draft server should pass to
-    ``LLM(...)``; this lets a single bare ``draft_tcp_server.py`` instance
+    ``LLM(...)``; this lets a single bare ``draft_rdma_server.py`` instance
     serve different draft models depending on which target connects.
     """
 

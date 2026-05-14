@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""IzzyCompatibleDraftServer — RDMA draft inference server (v2).
+"""Unified RDMA draft inference server.
 
 Speaks the 96-byte WRITE_WITH_IMM Draft API protocol that Phase 1
 defined, so it can interoperate with both:
 
-- our ``IbverbsDraftOffloadLayer`` target (Phase 4),
+- our ``IbverbsDraftOffloadLayer`` target,
 - izzy's ``standalone/mock_client.py`` (smoke-only, also 96-byte).
 
 Modes
@@ -16,10 +16,7 @@ Modes
 
 ``--backend transformers``
     Uses ``transformers.AutoModelForCausalLM`` to do real prefill +
-    decode.  Each request maintains a stateful KV cache across rounds —
-    in this Phase 6 the prompt is hard-coded by ``--prompt`` for
-    backward compatibility with the step-3 demo; Phase 7 will add a TCP
-    prompt-init channel for true multi-user serving.
+    decode.  Each request maintains a stateful KV cache across rounds.
 
 Run
 ---
@@ -27,10 +24,10 @@ Run
 ::
 
     # Mock mode (no model needed)
-    python3 draft_rdma_server_v2.py --backend mock --control-port 47001
+    python3 draft_rdma_server.py --backend mock --control-port 47001
 
     # Real-model mode (requires container)
-    python3 draft_rdma_server_v2.py --control-port 47001
+    python3 draft_rdma_server.py --control-port 47001
 """
 
 import argparse
@@ -57,8 +54,9 @@ import types
 #   submodules directly so mock-backend smoke tests can run on host.
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_SPEC_ROOT = os.path.join(_HERE, "TensorRT-LLM", "tensorrt_llm", "_torch", "speculative")
-sys.path.insert(0, os.path.join(_HERE, "TensorRT-LLM"))
+_REPO_ROOT = os.path.abspath(os.path.join(_HERE, "..", "..", ".."))
+_SPEC_ROOT = os.path.join(_REPO_ROOT, "tensorrt_llm", "_torch", "speculative")
+sys.path.insert(0, _REPO_ROOT)
 
 try:
     # Try the natural import first.  Works in the dev container; needed
@@ -71,7 +69,6 @@ try:
         _IbverbsRdmaBackend,
     )
     from tensorrt_llm._torch.speculative.spec_decode_channel import (  # noqa: F401,E402
-        EndpointStatus,
         SpecDecodeChannel,
     )
     from tensorrt_llm._torch.speculative.tcp_endpoint import (  # noqa: F401,E402
@@ -127,7 +124,6 @@ except Exception:
         _IbverbsRdmaBackend,
     )
     from tensorrt_llm._torch.speculative.spec_decode_channel import (  # noqa: F401,E402
-        EndpointStatus,
         SpecDecodeChannel,
     )
     from tensorrt_llm._torch.speculative.tcp_endpoint import (  # noqa: F401,E402
@@ -405,6 +401,25 @@ class IzzyCompatibleDraftServer:
                     max_num_requests=self._max_num_requests,
                 )
             )
+        elif transport == "doca":
+            from tensorrt_llm._torch.speculative.doca_endpoint import (
+                DocaEndpointConfig,
+                _DocaEndpointBackend,
+            )
+
+            endpoint = _DocaEndpointBackend(
+                DocaEndpointConfig(
+                    gpu_id=int(os.environ.get("GPU_ID", "0")),
+                    nic_name=self._args.nic or os.environ.get("NIC", "mlx5_0"),
+                    is_server=True,
+                    bind_port=int(self._args.port),
+                    remote_port=int(self._args.port),
+                    remote_peer_name="draft_lpu",
+                    payload_bytes=DraftApiProtocol.kMessageBytes,
+                    recv_queue_depth=int(self._max_num_requests),
+                    handshake_timeout_s=float(self._args.handshake_timeout_s),
+                )
+            )
         else:
             raise RuntimeError("unsupported data transport: %s" % transport)
         self._data_transport = transport
@@ -427,7 +442,7 @@ class IzzyCompatibleDraftServer:
         srv.bind(("0.0.0.0", self._args.control_port))
         srv.listen(8)
         self._tcp_listener_socket = srv
-        print("[draft-v2] control listener: port=%d" % self._args.control_port, flush=True)
+        print("[draft-rdma] control listener: port=%d" % self._args.control_port, flush=True)
 
         def _serve_one(client):
             try:
@@ -471,7 +486,7 @@ class IzzyCompatibleDraftServer:
             except (ConnectionError, OSError):
                 pass
             except Exception as exc:
-                print("[draft-v2] tcp client error: %r" % exc, flush=True)
+                print("[draft-rdma] tcp client error: %r" % exc, flush=True)
             finally:
                 try:
                     client.close()
@@ -528,10 +543,10 @@ class IzzyCompatibleDraftServer:
             except Exception:
                 extra = {}
             requested_transport = str(extra.get("transport", "")).lower()
-            if requested_transport not in ("tcp", "ibverbs"):
+            if requested_transport not in ("tcp", "ibverbs", "doca"):
                 ack = draft_session_protocol.TcpModelInitAck(
                     status="error",
-                    error="target must provide data transport tcp|ibverbs in TcpModelInit",
+                    error="target must provide data transport tcp|ibverbs|doca in TcpModelInit",
                 )
                 client.sendall(draft_session_protocol.serialize(ack))
                 return
@@ -560,14 +575,14 @@ class IzzyCompatibleDraftServer:
                         data_port=int(self._args.port),
                     )
                     print(
-                        "[draft-v2] model_init reused existing model=%s; cleared sessions"
+                        "[draft-rdma] model_init reused existing model=%s; cleared sessions"
                         % msg.model_path,
                         flush=True,
                     )
                     client.sendall(draft_session_protocol.serialize(ack))
                     return
                 print(
-                    "[draft-v2] model changed; reloading old=%s new=%s"
+                    "[draft-rdma] model changed; reloading old=%s new=%s"
                     % (getattr(self._backend, "model_path", "<mock>"), msg.model_path),
                     flush=True,
                 )
@@ -585,19 +600,19 @@ class IzzyCompatibleDraftServer:
             except Exception as exc:
                 self._backend = None
                 ack = draft_session_protocol.TcpModelInitAck(status="error", error=str(exc))
-                print("[draft-v2] model_init failed: %r" % exc, flush=True)
+                print("[draft-rdma] model_init failed: %r" % exc, flush=True)
             client.sendall(draft_session_protocol.serialize(ack))
 
     def run(self):
         self._start_tcp_prompt_listener()
         print(
-            "[draft-v2] waiting for TcpModelInit on port %d ..." % self._args.control_port,
+            "[draft-rdma] waiting for TcpModelInit on port %d ..." % self._args.control_port,
             flush=True,
         )
         if not self._backend_ready.wait(timeout=float(self._args.backend_init_timeout_s)):
             raise RuntimeError("timed out waiting for TcpModelInit")
         print(
-            "[draft-v2] backend ready; opening %s data-plane port %d"
+            "[draft-rdma] backend ready; opening %s data-plane port %d"
             % (self._data_transport, self._args.port),
             flush=True,
         )
@@ -610,7 +625,7 @@ class IzzyCompatibleDraftServer:
             raise RuntimeError("prime_recv failed: " + SpecDecodeChannel.to_string(s))
 
         print(
-            "[draft-v2] server listening: nic=%s port=%d max_requests=%d backend=%s"
+            "[draft-rdma] server listening: nic=%s port=%d max_requests=%d backend=%s"
             % (
                 self._args.nic,
                 self._args.port,
@@ -645,7 +660,7 @@ class IzzyCompatibleDraftServer:
                 bind_status = self._channel.bind_request_route(handle, route)
                 if bind_status != SpecDecodeChannel.Status.kOk:
                     print(
-                        "[draft-v2] bind failed slot=%s status=%s"
+                        "[draft-rdma] bind failed slot=%s status=%s"
                         % (route.slot, SpecDecodeChannel.to_string(bind_status)),
                         flush=True,
                     )
@@ -658,7 +673,7 @@ class IzzyCompatibleDraftServer:
                 SpecDecodeChannel.Status.kRouteNotFound,
             ):
                 print(
-                    "[draft-v2] pump status=%s — skipping" % SpecDecodeChannel.to_string(status),
+                    "[draft-rdma] pump status=%s — skipping" % SpecDecodeChannel.to_string(status),
                     flush=True,
                 )
                 continue
@@ -668,7 +683,7 @@ class IzzyCompatibleDraftServer:
 
             if int(received.imm_data.msg_type) != int(DraftApiProtocol.MessageType.kTargetToDraft):
                 print(
-                    "[draft-v2] unexpected msg_type=%s — dropping" % received.imm_data.msg_type,
+                    "[draft-rdma] unexpected msg_type=%s — dropping" % received.imm_data.msg_type,
                     flush=True,
                 )
                 continue
@@ -686,7 +701,7 @@ class IzzyCompatibleDraftServer:
                     round_seq=round_seq,
                 )
             except Exception as exc:
-                print("[draft-v2] backend.step failed: %r" % exc, flush=True)
+                print("[draft-rdma] backend.step failed: %r" % exc, flush=True)
                 continue
 
             tokens = list(draft_tokens) + [0] * (DraftApiProtocol.kMaxTokens - len(draft_tokens))
@@ -704,13 +719,13 @@ class IzzyCompatibleDraftServer:
             )
             if send_status != SpecDecodeChannel.Status.kOk:
                 print(
-                    "[draft-v2] send failed: %s" % SpecDecodeChannel.to_string(send_status),
+                    "[draft-rdma] send failed: %s" % SpecDecodeChannel.to_string(send_status),
                     flush=True,
                 )
                 break
             if self._round_count <= 5 or self._round_count % 50 == 0:
                 print(
-                    "[draft-v2] round=%d req=%d slot=%d round_seq=%d last_token=%d "
+                    "[draft-rdma] round=%d req=%d slot=%d round_seq=%d last_token=%d "
                     "→ tokens=%s"
                     % (
                         self._round_count,
@@ -728,9 +743,7 @@ class IzzyCompatibleDraftServer:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument(
-        "--nic", default="", help="RDMA device. Empty means choose the first available."
-    )
+    ap.add_argument("--nic", default="", help="RDMA device. Empty means use transport default.")
     ap.add_argument(
         "--port",
         type=int,
@@ -744,33 +757,21 @@ def main():
         default=0,
         help="TCP control-plane port for model-init / prompt-init / cancel",
     )
-    ap.add_argument(
-        "--tcp-prompt-port",
-        type=int,
-        default=0,
-        help="Deprecated alias for --control-port",
-    )
     # transformers-backend args
-    ap.add_argument(
-        "--model",
-        default=None,
-        help="Deprecated for lazy mode; target sends the model path via TcpModelInit",
-    )
     ap.add_argument(
         "--prompt", default=None, help="fixed prompt for stateful sessions (transformers backend)"
     )
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--backend-init-timeout-s", type=float, default=600.0)
+    ap.add_argument("--handshake-timeout-s", type=float, default=300.0)
     args = ap.parse_args()
-    if args.control_port <= 0 and args.tcp_prompt_port > 0:
-        args.control_port = args.tcp_prompt_port
     if args.control_port <= 0:
         ap.error("--control-port is required")
 
     server = IzzyCompatibleDraftServer(args)
 
     def _sig(*_):
-        print("[draft-v2] received signal, shutting down...", flush=True)
+        print("[draft-rdma] received signal, shutting down...", flush=True)
         server.stop()
 
     signal.signal(signal.SIGINT, _sig)

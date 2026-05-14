@@ -5,8 +5,8 @@ r"""DOCA-progression Phase 1 — target driver script.
 
 Standard programmatic ``LLM`` entry point. Enables ``DraftTargetDecoding``
 with ``draft_offload_v2=True`` and ``draft_offload_v2_transport='tcp'``,
-so the v2 layer pushes prompts + per-token round-trips to a separate
-draft process (see ``draft_tcp_server.py``).
+so the offload layer pushes prompts + per-token round-trips to a separate
+draft process (see ``draft_rdma_server.py``).
 
 The greedy output should be **byte-identical** to a fresh
 ``LLM(target_model).generate(prompt, max_tokens=...)`` baseline because
@@ -17,7 +17,7 @@ Usage:
     GPU_ID=4 python3 examples/llm-api/rdma/spec_dec_target_main.py \\
         --target-model /scratch.trt_llm_data/llm-models/Qwen3/Qwen3-4B \\
         --draft-model  /scratch.trt_llm_data/llm-models/Qwen3/Qwen3-1.7B \\
-        --draft-host 127.0.0.1 --draft-port 47900 --draft-control-port 47901 \\
+        --draft-host 127.0.0.1 --draft-control-port 47901 \\
         --prompt "Explain GPUDirect RDMA in one short sentence." \\
         --max-tokens 64 --max-draft-len 4
 """
