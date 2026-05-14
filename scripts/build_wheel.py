@@ -1039,6 +1039,13 @@ def main(*,
             for lib in doca_rdma_libs:
                 install_file(lib, doca_rdma_pkg_dir / lib.name)
 
+        ibverbs_ext_build_dir = build_dir / "tensorrt_llm" / "ibverbs_ext"
+        ibverbs_ext_pkg_dir = pkg_dir / "_torch" / "speculative" / "ibverbs_ext"
+        ibv_wrapper = ibverbs_ext_build_dir / "libibv_wrapper.so"
+        if ibv_wrapper.exists():
+            ibverbs_ext_pkg_dir.mkdir(parents=True, exist_ok=True)
+            install_file(ibv_wrapper, ibverbs_ext_pkg_dir / ibv_wrapper.name)
+
         if not skip_stubs:
             with working_directory(pkg_dir):
                 if on_windows:

@@ -42,6 +42,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional, Protocol
 
 from .spec_decode_channel import EndpointPacket, EndpointStatus
@@ -320,6 +321,11 @@ _LIBWRAP = None
 _LIB_LOAD_LOCK = threading.Lock()
 
 
+def _packaged_wrapper_path():
+    path = Path(__file__).resolve().parent / "ibverbs_ext" / "libibv_wrapper.so"
+    return str(path) if path.exists() else None
+
+
 def _load_libs(wrapper_path=None):
     """Load and (idempotently) configure libibverbs + the wrapper."""
     global _LIBVERBS, _LIBWRAP
@@ -378,7 +384,9 @@ def _load_libs(wrapper_path=None):
             _v.ibv_modify_qp.restype = ctypes.c_int
             _v.ibv_modify_qp.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
         if _LIBWRAP is None:
-            path = wrapper_path or os.environ.get("TLLM_RDMA_WRAPPER_PATH")
+            path = (
+                wrapper_path or os.environ.get("TLLM_RDMA_WRAPPER_PATH") or _packaged_wrapper_path()
+            )
             if not path:
                 # Default to project repo layout.
                 path = "/home/scratch.zhaoyangw_gpu/rdma/libibv_wrapper.so"

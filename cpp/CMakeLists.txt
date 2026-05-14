@@ -646,6 +646,9 @@ if(TRTLLM_ENABLE_DOCA_RDMA)
   add_subdirectory(
     ${TRT_LLM_ROOT_DIR}/tensorrt_llm/_torch/speculative/doca_rdma_ext
     ${CMAKE_BINARY_DIR}/tensorrt_llm/doca_rdma_ext)
+  add_subdirectory(
+    ${TRT_LLM_ROOT_DIR}/tensorrt_llm/_torch/speculative/ibverbs_ext
+    ${CMAKE_BINARY_DIR}/tensorrt_llm/ibverbs_ext)
 endif()
 
 if(BUILD_TESTS)
@@ -676,5 +679,6 @@ set(BUILD_WHEEL_TARGETS
     CACHE STRING "Targets used to build wheel")
 if(TRTLLM_ENABLE_DOCA_RDMA)
   list(APPEND BUILD_WHEEL_TARGETS doca_rdma_ext)
+  list(APPEND BUILD_WHEEL_TARGETS ibverbs_ext)
 endif()
 add_custom_target(build_wheel_targets DEPENDS ${BUILD_WHEEL_TARGETS})
