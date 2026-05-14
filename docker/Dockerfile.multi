@@ -59,10 +59,11 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # Install UCX, NIXL, etcd
 # TODO: Combine these into the main install.sh script
+ARG DISABLE_NIXL_GPUNETIO=0
 RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
     --mount=type=cache,target=/root/.cache/pip \
     GITHUB_MIRROR=${GITHUB_MIRROR} bash /opt/docker/common/install_ucx.sh && \
-    GITHUB_MIRROR=${GITHUB_MIRROR} bash /opt/docker/common/install_nixl.sh && \
+    GITHUB_MIRROR=${GITHUB_MIRROR} DISABLE_NIXL_GPUNETIO=${DISABLE_NIXL_GPUNETIO} bash /opt/docker/common/install_nixl.sh && \
     bash /opt/docker/common/install_etcd.sh && \
     rm -rf /root/.cache/uv/archive-v0 && \
     # WAR against https://github.com/advisories/GHSA-58pv-8j8x-9vj2

@@ -55,6 +55,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 from .draft_api_protocol import DraftApiProtocol
@@ -93,9 +94,25 @@ class DocaEndpointConfig:
     izzy_build_dir: Optional[str] = None
 
 
+def _packaged_extension_dir() -> Optional[str]:
+    path = Path(__file__).resolve().parent / "doca_rdma_ext"
+    if list(path.glob("doca_rdma*.so")) and (path / "doca_rdma_ops.so").exists():
+        return str(path)
+    return None
+
+
+def _resolve_izzy_build_dir(build_dir: Optional[str]) -> str:
+    return (
+        build_dir
+        or os.environ.get("DOCA_RDMA_BUILD")
+        or _packaged_extension_dir()
+        or "/opt/doca_rdma_izzy/build"
+    )
+
+
 def _load_izzy(build_dir: Optional[str]):
     """Import izzy's pybind module + load its torch ops .so."""
-    path = build_dir or os.environ.get("DOCA_RDMA_BUILD") or "/opt/doca_rdma_izzy/build"
+    path = _resolve_izzy_build_dir(build_dir)
     if path and path not in sys.path:
         sys.path.insert(0, path)
     import torch
@@ -194,14 +211,17 @@ class _DocaEndpointBackend:
 
             peer = str(self._cfg.remote_peer_name)
             if self._cfg.is_server:
-                ok = self._ep.accept_peer(int(self._cfg.bind_port or self._cfg.remote_port), peer)
+                port = int(self._cfg.bind_port or self._cfg.remote_port)
+                ok = self._ep.accept_peer(port, peer)
             else:
                 # The draft side may still be opening its DOCA accept
                 # port after loading the model. Retry connect until
                 # handshake_timeout_s elapses.
                 deadline = time.monotonic() + float(self._cfg.handshake_timeout_s)
                 ok = False
+                attempt = 0
                 while time.monotonic() < deadline:
+                    attempt += 1
                     ok = self._ep.connect_to_peer(
                         str(self._cfg.remote_host), int(self._cfg.remote_port), peer
                     )
