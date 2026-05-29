@@ -437,7 +437,11 @@ class SpecMetadata:
     runtime_draft_len: int = 0
 
     # For non-greedy sampling on 1-model.
-    allow_advanced_sampling: bool = False
+    # Auto-detected per step from populated sampling params:
+    # True if any request needs temp/top_k/top_p, False if all greedy.
+    # Used as part of the CUDA graph key so we capture two variants
+    # (greedy fast-path vs advanced sampling) and dispatch at replay.
+    uses_advanced_sampling: bool = False
     # Whether to use rejection sampling for one-model speculative decoding.
     use_rejection_sampling: bool = False
     # Sampling parameters for non-greedy sampling (per-request)
@@ -519,8 +523,7 @@ class SpecMetadata:
         from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
         from tensorrt_llm.sampling_params import SamplingParams
 
-        if not self.allow_advanced_sampling or not self.spec_dec_mode.use_one_engine(
-        ):
+        if not self.spec_dec_mode.use_one_engine():
             return
 
         if self.temperatures is None:
@@ -673,6 +676,11 @@ class SpecMetadata:
         self.skip_top_k = not top_k_enabled
         self.skip_top_p = not top_p_enabled
         self.has_greedy_requests = has_greedy_requests
+        # Advanced sampling is needed iff any sampling param is active.
+        # When all skip_* flags are True, the entire batch can run argmax fast-path.
+        # This boolean is part of the CUDA graph key so we capture both variants.
+        self.uses_advanced_sampling = not (self.skip_temperature and
+                                           self.skip_top_k and self.skip_top_p)
 
 
 class SpecWorkerBase(nn.Module, ABC):
@@ -1282,7 +1290,7 @@ class SpecWorkerBase(nn.Module, ABC):
         Returns:
             sampled_tokens: [num_tokens] - Sampled token ids
         """
-        if spec_metadata.allow_advanced_sampling:
+        if spec_metadata.uses_advanced_sampling:
             num_gens = batch_size - num_contexts
             num_tokens = num_contexts + num_gens * (
                 spec_metadata.runtime_draft_len + 1)
