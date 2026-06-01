@@ -717,7 +717,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 if spec_metadata.use_rejection_sampling:
                     draft_logits_list.append(logits.clone())
 
-                new_draft_token = self.draft_decoder(logits, draft_model)
+                new_draft_token = self.draft_decoder(logits, draft_model,
+                                                     spec_metadata, batch_size)
                 next_draft_tokens.append(new_draft_token)
                 # update inputs
                 hidden_states = hidden_states_to_save[gather_ids]
@@ -794,27 +795,27 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         self,
         logits: torch.Tensor,
         draft_model: nn.Module,
+        spec_metadata: Optional[Eagle3OneModelSpecMetadata] = None,
+        batch_size: Optional[int] = None,
     ):
         '''
-        Sampling draft tokens with support for non-greedy sampling.
+        Sample draft tokens. When spec_metadata + batch_size are provided, use
+        the target's per-request sampling params (temperature/top_k/top_p);
+        otherwise fall back to argmax.
 
         Args:
-            logits: torch.Tensor
-                [num_tokens, vocab_size]
-                Logits produced by the draft model.
-            draft_model: nn.Module
-                The draft model.
-
-        Returns:
-            draft_tokens: torch.Tensor
-                [batch_size * max_draft_len]
-                Draft token ids. Flattened.
+            logits: [batch_size, vocab_size] - Draft model logits.
+            draft_model: The draft model.
+            spec_metadata: Carries per-request sampling param tensors. When
+                None, sampling is forced greedy.
+            batch_size: Active requests, used to slice per-request tensors.
         '''
 
         d2t = getattr(draft_model.model, "d2t", None)
-        draft_tokens = self._draft_sampler_greedy(logits, d2t)
-
-        return draft_tokens
+        if spec_metadata is not None and batch_size is not None:
+            return self._draft_sampler_advanced(logits, spec_metadata,
+                                                batch_size, d2t)
+        return self._draft_sampler_greedy(logits, d2t)
 
     def prepare_1st_drafter_inputs(
         self,
